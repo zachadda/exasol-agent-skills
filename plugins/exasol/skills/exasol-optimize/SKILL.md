@@ -1,6 +1,62 @@
 ---
 name: exasol-optimize
 description: Database-first schema optimization for Exasol — Kimball-aware constraint inference, FK widening, join-path discovery, Unknown Member generation, and dry-run batch validation via the EXA_OPTIMIZE Lua UDFs.
+
+# Structured contract (see skill-catalog-architecture for the orchestrator contract)
+preconditions:
+  - schema_imported:
+      doc: "Target schema exists with at least one non-virtual table"
+      check: |
+        SELECT COUNT(*) AS N FROM SYS.EXA_ALL_TABLES
+        WHERE UPPER("TABLE_SCHEMA") = UPPER(:source_schema)
+          AND "TABLE_IS_VIRTUAL" = FALSE
+      satisfied_by: exasol-migrate-snowflake
+  - udf_installed:
+      doc: "EXA_OPTIMIZE.ANALYZE_CONSTRAINTS script is registered"
+      check: |
+        SELECT COUNT(*) AS N FROM SYS.EXA_ALL_SCRIPTS
+        WHERE "SCRIPT_SCHEMA" = 'EXA_OPTIMIZE'
+          AND "SCRIPT_NAME" IN ('ANALYZE_CONSTRAINTS', 'INFER_JOIN_PATHS',
+                                'BUILD_UNKNOWN_MEMBER_INSERT', 'DRY_RUN_PLAN',
+                                'VALIDATE_JOIN_PLAN')
+        HAVING COUNT(*) >= 5
+      satisfied_by: exasol-optimize-install   # self-install reference documented in udf-install.md
+
+provides:
+  - schema_optimized:
+      doc: "Source schema carries declared PRIMARY KEY constraints on every PK candidate the heuristic could resolve"
+      verify: |
+        SELECT COUNT(*) AS N FROM SYS.EXA_ALL_CONSTRAINT_COLUMNS
+        WHERE "CONSTRAINT_SCHEMA" = UPPER(:source_schema)
+          AND "CONSTRAINT_TYPE" = 'PRIMARY KEY'
+  - join_graph_emitted:
+      doc: "INFER_JOIN_PATHS produces at least one row (declared_fk or stem_match) for the schema. Useful when downstream cube creation needs join discovery"
+      verify: |
+        -- Independent verification cannot run via SQL because INFER_JOIN_PATHS
+        -- is invoked via EXECUTE SCRIPT and produces a result set, not a side-
+        -- effect. Treat the orchestrator's captured-row count from Step N as
+        -- the source of truth. See references/cube-profiler.md.
+
+parameters:
+  required:
+    - source_schema:
+        doc: "Schema to analyze (case-insensitive, will be uppercased)"
+  optional:
+    - apply_mode:
+        default: dry_run
+        doc: "dry_run = validate only via DRY_RUN_PLAN (rollback DML, DDL persists); commit = same plan but committed"
+    - llm_enrichment:
+        default: true
+        doc: "When true, LLM annotates findings with column-naming hints and flags self-FK / hierarchy candidates for manual review before DRY_RUN_PLAN runs"
+    - target_action:
+        default: full_analyze
+        doc: "full_analyze = ANALYZE_CONSTRAINTS + DRY_RUN_PLAN. constraints_only = ANALYZE_CONSTRAINTS only (no apply). joins_only = INFER_JOIN_PATHS only (no constraint changes)"
+
+# Estimated impact templates for plan-presentation phase in orchestrator skills
+estimated_impact:
+  full_analyze: "~{N} ALTER statements, 30 sec — N from ANALYZE_CONSTRAINTS dry-run count"
+  constraints_only: "Read-only catalog scan, 10 sec"
+  joins_only: "Read-only catalog scan, 5 sec"
 ---
 
 # Exasol Optimize Skill
