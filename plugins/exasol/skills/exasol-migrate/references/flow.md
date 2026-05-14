@@ -1,214 +1,271 @@
 # Migration flow (vendor-agnostic)
 
-Shared mechanics for IMPORT FROM JDBC migrations. Vendor-specific bits — connection string, auth, type quirks — live in `references/<vendor>.md`. Read this first, then layer the vendor file.
+The shared pipeline the skill follows against any source system in `studio/backend/fixtures/migration-scripts/`. Vendor-specific knobs are in `references/<vendor>.md`; read this first.
 
-## The IMPORT FROM JDBC statement
+Canonical source code:
+- IMPORT statement builder: `studio/backend/routers/imports.py:_build_import_sql()`
+- CONNECTION test: `_build_connection_test_sql()` (same file)
+- Driver presets: `studio/backend/routers/imports.py:DRIVER_PRESETS`
+- Driver placement: `studio/backend/services/bucketfs.py:_preferred_source_dir()`
+- Credential storage: `studio/backend/services/connection_profiles.py`
+- Migration scripts: `studio/backend/fixtures/migration-scripts/<vendor>_to_exasol.sql`
 
-Canonical shape Exasol uses for every vendor:
+## The CREATE CONNECTION pattern
+
+The studio backend's flow is **not** "inline credentials in every IMPORT statement." It's:
+
+1. **Create a named Exasol CONNECTION** with the JDBC URL + credentials
+2. **Migration script reads from that CONNECTION** by name when generating per-table IMPORTs
+3. **DROP the CONNECTION** when done (credential hygiene)
 
 ```sql
-IMPORT INTO <TARGET_SCHEMA>.<TABLE> (<COL_LIST>)
-FROM JDBC
-  DRIVER  = '<VENDOR_UPPER>'
-  AT      '<JDBC_URL>'
-  USER    '<USER>'
-  IDENTIFIED BY '<PASSWORD>'
-  STATEMENT 'SELECT * FROM <SOURCE_SCHEMA>.<TABLE>';
+-- 1. Create
+CREATE OR REPLACE CONNECTION "SNOWFLAKE_MIGRATE_20260513"
+  TO 'jdbc:snowflake://acct.snowflakecomputing.com/?warehouse=COMPUTE_WH'
+  USER 'svc_acct'
+  IDENTIFIED BY '<password>';
+
+-- 2. Invoke migration script (creates and executes IMPORTs internally)
+EXECUTE SCRIPT EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL(
+    'SNOWFLAKE_MIGRATE_20260513',     -- CONNECTION_NAME
+    FALSE,                            -- DB2SCHEMA (keep db.schema.table flat → schema.table)
+    'ACME_DEMO',                      -- DB_FILTER (Snowflake DB)
+    'ADVENTUREWORKS',                 -- SCHEMA_FILTER
+    'ADVENTUREWORKS',                 -- TARGET_SCHEMA (empty = use source name)
+    '%',                              -- TABLE_FILTER (all tables)
+    TRUE,                             -- IDENTIFIER_CASE_INSENSITIVE (uppercase)
+    'EXECUTE',                        -- EXECUTION_MODE
+    'AUTO',                           -- PARALLEL_CONNECTIONS (75% of cluster VCPUs)
+    'EXA_DB_MIGRATION'                -- LOGGING_SCHEMA
+);
+
+-- 3. Drop the connection
+DROP CONNECTION "SNOWFLAKE_MIGRATE_20260513";
 ```
 
-Three things to notice:
+Why a named CONNECTION over inline credentials:
 
-1. **Target schema must exist and target table must exist with matching columns.** Exasol does NOT infer schema from JDBC metadata at IMPORT time. The CREATE TABLE step is separate and precedes IMPORT.
-2. **STATEMENT is run on the source side.** Filtering / projection / sampling are pushed to source via the SQL string. Cheap when source supports the operators.
-3. **DRIVER is the directory name under `/exa/jdbc/`.** Uppercase. See `exasol-nano-local` `jdbc-drivers.md`.
+- **Cleaner audit trail.** `SYS.EXA_DBA_CONNECTIONS` lists active connections.
+- **Credentials encrypted at rest.** Exasol stores connection passwords encrypted with the cluster master key.
+- **Reuse across multiple IMPORTs.** Migration scripts issue many IMPORTs (one per source table); each references the same connection by name.
+- **Match studio convention.** `routers/imports.py:_build_import_sql()` exclusively uses `AT <connection_name>`.
 
 ## Pipeline steps
 
-### 1. Resolve vendor reference
+### 1. Resolve driver preset
 
-Load `references/<source_vendor>.md`. Extract:
+Look up `source_type` in `studio/backend/routers/imports.py:DRIVER_PRESETS`. Each row:
 
-- JDBC URL template (`jdbc:snowflake://<account>.snowflakecomputing.com/?...`)
-- Required env vars (`SNOWFLAKE_USER`, etc.)
-- Auth modes supported (password, key-pair, OAuth)
-- Type mapping table (source type → Exasol DDL)
-- INFORMATION_SCHEMA dialect for table enumeration
-
-If `source_vendor` has no reference file → halt:
-
-> "exasol-migrate v0.1 only supports: snowflake. For others, fall back to CSV (see csv-fallback.md) or wait for vendor-specific reference."
-
-### 2. Build the JDBC URL
-
-```
-url = jdbc_url_override OR <vendor_template>.substitute(env)
+```python
+DriverPreset(
+    source_type="snowflake",
+    driver_name="SNOWFLAKE",                                    # Used in IMPORT FROM JDBC DRIVER='<driver_name>' (legacy) or just for jar lookup
+    driver_main="net.snowflake.client.jdbc.SnowflakeDriver",
+    prefix="jdbc:snowflake:",                                   # URL stem
+    versions=[
+        DriverVersion(version="3.22.0", jar_name="snowflake-jdbc-3.22.0.jar", is_recommended=True),
+    ],
+)
 ```
 
-For Snowflake:
+If `source_type` is not in DRIVER_PRESETS but IS in `fixtures/migration-scripts/` (bigquery, azure_sql, db2, sap_hana, etc.), the user must supply their own driver jar + `jdbc_url`.
 
+### 2. Verify driver jar present
+
+For Docker-container mode (`EXA_NANO_CONTAINER_NAME` set):
+
+```bash
+docker exec exanano-sqlcube ls /exa/jdbc/<DRIVER_NAME_UPPER>/ | grep '\.jar$'
+```
+
+Other modes per `services/bucketfs.py:_preferred_source_dir()`:
+
+| Mode | Path |
+|---|---|
+| Docker container | `/exa/jdbc/<DRIVER_NAME_UPPER>/` |
+| Native local | `~/.exanano/jdbc/<DRIVER_NAME_UPPER>/` |
+| Local filesystem | `<configured-root>/<source_type>/` |
+| BucketFS | `<exa_bucketfs_url>/<import_path>/<source_type>/` |
+
+Driver casing: ExaNano (container) mode uppercases. Don't mix.
+
+### 3. Build JDBC URL
+
+Composition:
+- If `jdbc_url` parameter supplied → use verbatim
+- Else → `preset.prefix + vendor-specific suffix`
+
+Snowflake example:
 ```
 jdbc:snowflake://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/
   ?warehouse=${SNOWFLAKE_WAREHOUSE}
-  &db=${SOURCE_DATABASE}
-  &schema=${SOURCE_SCHEMA_NAME}
+  &db=${SOURCE_DB}
+  &schema=${SOURCE_SCHEMA}
 ```
 
-(Single-line; readability formatted above.)
+(Single line at exec time; readability formatted here.)
 
-If `jdbc_url_override` is set, use it verbatim. Don't merge — full override.
-
-### 3. Test connection
-
-Round-trip a SELECT 1 before committing to a long migration:
+### 4. CREATE CONNECTION
 
 ```sql
-IMPORT INTO (X DECIMAL(18))
-FROM JDBC
-  DRIVER  = '<VENDOR>'
-  AT      '<URL>'
-  USER    '<USER>'
-  IDENTIFIED BY '<PASSWORD>'
-  STATEMENT 'SELECT 1';
+CREATE OR REPLACE CONNECTION "<CONNECTION_NAME>"
+  TO '<jdbc_url>'
+  USER '<source_user>'
+  IDENTIFIED BY '<source_password>';
 ```
 
-Returns 1 row → connection works. Errors land in `troubleshooting.md` of the vendor reference (or `exasol-nano-local/troubleshooting.md` §7).
+Connection name convention: `<SOURCE_TYPE_UPPER>_MIGRATE_<UNIX_TIMESTAMP>`. Identifier-quoted so case-sensitive names round-trip.
 
-### 4. Enumerate source tables
+Credentials source priority:
+1. Direct skill parameters (`source_user`, `source_password`)
+2. Studio's local SQLite (`connection_profiles.py:get_profile(name)`) — Fernet-encrypted, key derived from `STUDIO_SESSION_SECRET`
+3. Halt with credential-missing error — never prompt on stdout
 
-Each vendor exposes a different INFORMATION_SCHEMA dialect. Generic shape:
+### 5. Test the connection
 
-```sql
-SELECT TABLE_NAME, ROW_COUNT
-FROM <VENDOR_INFORMATION_SCHEMA>.TABLES
-WHERE TABLE_SCHEMA = '<SOURCE_SCHEMA>'
-  AND TABLE_TYPE = 'BASE TABLE'
-```
-
-Execute via IMPORT-with-STATEMENT round-trip:
+Per `routers/imports.py:_build_connection_test_sql()`:
 
 ```sql
 SELECT * FROM (
-  IMPORT INTO (TABLE_NAME VARCHAR(200), ROW_COUNT DECIMAL(18))
-  FROM JDBC
-    DRIVER = '<VENDOR>' AT '<URL>' USER '<U>' IDENTIFIED BY '<P>'
-    STATEMENT '<enumeration SQL>'
+  IMPORT FROM JDBC AT "<CONNECTION_NAME>"
+  STATEMENT 'SELECT CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_WAREHOUSE()'
+) t;
+```
+
+Returns one row when connection is alive. Vendor-specific column references — adapt the STATEMENT per source dialect:
+
+- Snowflake: `CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_WAREHOUSE()`
+- Postgres: `SELECT current_database(), current_schema()`
+- Oracle: `SELECT USER FROM DUAL`
+- SQL Server: `SELECT DB_NAME(), SCHEMA_NAME()`
+
+Failure → halt before invoking the migration script.
+
+### 6. Invoke the vendor migration script
+
+```sql
+EXECUTE SCRIPT EXA_DB_MIGRATION.<VENDOR>_TO_EXASOL(
+    '<connection_name>',
+    <vendor-specific params per references/<vendor>.md>,
+    '<execution_mode>',
+    <parallel_connections>,
+    '<logging_schema>'
 );
 ```
 
-Cache result in Exasol-side staging table `<TARGET_SCHEMA>.__SOURCE_TABLES__` for the rest of the pipeline.
+The script:
+- Connects via the named CONNECTION
+- Enumerates source tables matching `SCHEMA_FILTER` + `TABLE_FILTER`
+- Generates per-table IMPORT statements using `_build_import_sql()` shape (`IMPORT INTO "schema"."table" FROM JDBC AT "conn" STATEMENT 'SELECT ...'`)
+- Runs them serially OR in parallel (PARALLEL_CONNECTIONS param)
+- Writes to JOB_LOG / JOB_DETAILS when LOGGING_SCHEMA set
 
-### 5. Apply include / exclude filters
+### 7. Monitor JOB_LOG / JOB_DETAILS
 
-In-memory filter over the enumerated list:
-
-```
-candidates = enumerated_tables
-if include_tables: candidates = [t for t in candidates if t in include_tables]
-if exclude_tables: candidates = [t for t in candidates if t not in exclude_tables]
-```
-
-Both lists are plain comma-separated. No glob support in v0.1.
-
-### 6. Plan + present
-
-Render a table to the user:
-
-```
-Source: <vendor>.<source_database>.<source_schema>
-Target: <target_schema> (exists / will be created / will be replaced)
-
-Tables to migrate:
-- ORDERS           ~ 1,500,000 rows
-- LINEITEM         ~ 6,000,000 rows
-- CUSTOMER         ~   150,000 rows
-- ...
-Total: 12 tables, ~12.5M rows (sample_only=false)
-
-Estimated time: 3–8 min (vendor-network dependent)
-
-Proceed? [y/n/inspect]
-```
-
-`inspect` mode: show the CREATE TABLE DDL we'll run + the first IMPORT statement before continuing. Used by skeptical users who want to eyeball the type mapping.
-
-### 7. Create target schema
+When `EXECUTION_MODE='EXECUTE'` AND `LOGGING_SCHEMA` is non-null, the script auto-creates and writes to:
 
 ```sql
--- If drop_target=true AND user confirmed:
-DROP SCHEMA IF EXISTS <TARGET_SCHEMA> CASCADE;
+EXA_DB_MIGRATION.JOB_LOG (
+    RUN_ID       INT IDENTITY PRIMARY KEY,
+    SCRIPT_NAME  VARCHAR(100),
+    STATUS       VARCHAR(100),       -- RUNNING | OK | FAILED
+    START_TIME   TIMESTAMP,
+    END_TIME     TIMESTAMP
+);
 
--- Always:
-CREATE SCHEMA IF NOT EXISTS <TARGET_SCHEMA>;
-OPEN SCHEMA <TARGET_SCHEMA>;
+EXA_DB_MIGRATION.JOB_DETAILS (
+    DETAIL_ID    INT IDENTITY,
+    RUN_ID       INT REFERENCES JOB_LOG(RUN_ID),
+    LOG_TIME     TIMESTAMP,
+    LOG_LEVEL    VARCHAR(10),        -- INFO | WARN | ERROR
+    LOG_MESSAGE  VARCHAR(2000000),
+    ROWCOUNT     DECIMAL(18)
+);
 ```
 
-DROP is destructive — never silent. User confirmation captured in step 6.
+Skill polls:
 
-### 8. Per-table migration loop
-
-For each table:
-
-```
-a. Inspect source columns (vendor INFORMATION_SCHEMA.COLUMNS)
-b. Map types vendor → Exasol  (vendor reference's mapping table)
-c. CREATE TABLE target.T (<mapped columns>)
-d. IMPORT INTO target.T (cols) FROM JDBC ... STATEMENT 'SELECT cols FROM source.T'
-   (+ LIMIT 10000 if sample_only)
-e. SELECT COUNT(*) FROM target.T   → log target_rowcount
-f. Compare to source rowcount      → status = ok | warn | mismatch
-g. Append to manifest
+```sql
+SELECT STATUS FROM EXA_DB_MIGRATION.JOB_LOG WHERE RUN_ID = <run_id>;
+-- RUNNING → poll again
+-- OK → migration successful
+-- FAILED → fetch JOB_DETAILS where LOG_LEVEL='ERROR'
 ```
 
-Failure modes:
+The migration script also pre-installs `EXA_DB_MIGRATION.QUERY_WRAPPER` (from `query_wrapper.sql` fixture) — that's the helper class the migration scripts use for logging. If JOB_LOG/JOB_DETAILS creation fails because QUERY_WRAPPER isn't installed, run `scripts_library.install_fixture("migration-scripts")` or directly `EXECUTE SCRIPT` against `query_wrapper.sql`.
 
-- **CREATE TABLE fails (e.g., reserved keyword as column name):** quote-wrap the offending name, retry once. If still fails, mark row as `ddl_failed`, skip IMPORT, continue to next table.
-- **IMPORT fails (auth / network / TLS):** halt the entire pipeline — these are systemic. Report current state and exit.
-- **IMPORT fails (single-table type mismatch / value out of range):** log to manifest as `import_failed`, continue.
-- **Row count mismatch with sample_only=false:** flag as `warn`, don't halt. User decides.
+Set `LOGGING_SCHEMA=NULL` to disable logging — slightly faster, no audit. Use only for throwaway runs.
 
-### 9. Verify provides
-
-After the loop, run the `schema_imported` verify SQL:
+### 8. Verify `schema_imported` provides
 
 ```sql
 SELECT COUNT(*) FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '<TARGET_SCHEMA>';
 ```
 
-Must equal `|candidates|` minus tables marked `ddl_failed` or `import_failed`. If less → something silently disappeared; halt and report.
+Expected: matches the table count from JOB_DETAILS or a DEBUG-mode dry run.
 
-Also write the manifest file:
+### 9. DROP the connection
 
-```
-<TARGET_SCHEMA>__migration_manifest.csv
-source_table,source_rowcount,target_rowcount,status,error_message
-```
-
-Manifest survives the agent session and is consumed by downstream skills (`exasol-optimize` reads it to know which tables to skip).
-
-### 10. Hand back to caller
-
-Return summary:
-
-```
-Migrated <N>/<M> tables (~<R> rows) from <vendor>.<source_schema>
-to <target_schema> in <duration>. Manifest at <path>.
-Failures: <list> (see manifest for details).
+```sql
+DROP CONNECTION "<CONNECTION_NAME>";
 ```
 
-## Type mapping principles
+Credential hygiene. Skill SHOULD do this even on failure paths.
 
-Conservative wins over precise. The optimize skill downstream can tighten widths (it's literally what `analyze_constraints` is for). At IMPORT time:
+### 10. Return summary
 
-- **Source NUMERIC / NUMBER without scale info:** Exasol `DECIMAL(36,18)`. Don't lose precision.
-- **Source VARCHAR with explicit max length:** Exasol `VARCHAR(<n>)` if `n <= 2000000`, else `VARCHAR(2000000)`.
-- **Source VARCHAR without max:** Exasol `VARCHAR(2000000)` (max). Optimize will narrow.
-- **Source DATE / TIMESTAMP / TIMESTAMP WITH TIME ZONE:** preserve. Exasol has `DATE`, `TIMESTAMP`, no TZ-aware type — TZ-aware sources convert to UTC TIMESTAMP, document in manifest.
-- **Source BOOLEAN:** Exasol `BOOLEAN`.
-- **Source binary / blob:** Exasol has no BLOB. Skip with a manifest warning unless user explicitly requests CHAR-encoded fallback.
-- **Source JSON / VARIANT / STRUCT:** Exasol `VARCHAR(2000000)`. Schema-on-read pattern; optimize won't touch it.
+```
+Migrated <N>/<M> tables from <source_type>.<schema> to <TARGET_SCHEMA>.
+Run id: <run_id>. JOB_LOG status: OK.
+Errors: <list from JOB_DETAILS where LOG_LEVEL='ERROR'>.
+```
 
-Vendor reference files list specific quirks (Snowflake VARIANT, Postgres ARRAY, MySQL ENUM, etc.).
+## Type mapping
+
+The migration scripts handle type mapping per-vendor. Conservative defaults across most scripts:
+- Numeric without scale → `DECIMAL(36,18)`
+- Date/time → preserved when Exasol has a matching type, else converted to UTC `TIMESTAMP`
+- VARCHAR no max → `VARCHAR(2000000)` (Exasol max)
+- Semi-structured (JSON / VARIANT / ARRAY) → `VARCHAR(2000000)` text
+- Binary → skipped with manifest warning (no Exasol BLOB type)
+
+Per-vendor specifics in `references/<vendor>.md` and within the script's Lua body.
 
 ## Parallelization
 
-Per-table IMPORTs are sequential in v0.1 — single connection, clean failure attribution. If the user has a 1000-table schema and complains, future versions can dispatch in parallel via `EXECUTE SCRIPT` batches. Don't optimize until someone hits the wall.
+`PARALLEL_CONNECTIONS` controls IMPORT concurrency:
+- Integer N → N parallel IMPORTs across tables
+- `'AUTO'` → 75% of cluster VCPUs (queried from `EXA_STATISTICS.EXA_SYSTEM_EVENTS` at script start)
+- `'INFO'` → print VCPU stats, don't migrate
+- NULL / unset → serial (1 connection)
+
+For a 1-node `exanano-sqlcube` Docker (typical dev): AUTO gives 6-12 parallel depending on host. For large source tables, parallelism helps; for many-small-table schemas, the per-table fixed cost dominates and AUTO ≈ serial.
+
+## DEBUG mode for inspection
+
+`EXECUTION_MODE='DEBUG'` returns the generated SQL as a result set instead of executing. The studio's UI exposes this for review-before-execute workflows.
+
+```sql
+EXECUTE SCRIPT EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL(
+    'SNOWFLAKE_MIGRATE_20260513',
+    FALSE, 'ACME_DEMO', 'ADVENTUREWORKS', 'ADVENTUREWORKS', '%',
+    TRUE,
+    'DEBUG',                          -- ← inspect mode
+    NULL,
+    NULL
+);
+```
+
+Returns N rows where each row is `(SQL_TEXT, SUCCESS, ERROR_MESSAGE)` for a single CREATE SCHEMA / CREATE TABLE / IMPORT INTO statement. Read, review, run manually OR re-invoke with `EXECUTION_MODE='EXECUTE'`.
+
+## Error handling
+
+Per-table failures don't abort the whole migration. The script:
+- Catches `pquery` errors at IMPORT level
+- Logs to JOB_DETAILS with LOG_LEVEL='ERROR'
+- Continues to next table
+- Marks JOB_LOG.STATUS='FAILED' at end if any error logged
+
+Connection-level failures (auth, network, TLS) ARE fatal and halt before any table is touched.
+
+For partial migrations: re-run with TABLE_FILTER narrowed to the failed subset. Migration scripts respect the filter.

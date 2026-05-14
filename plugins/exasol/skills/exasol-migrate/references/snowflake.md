@@ -1,79 +1,59 @@
 # Snowflake source
 
-Vendor-specific knobs for migrating a Snowflake schema into Exasol. Read `flow.md` first for the shared pipeline.
+Vendor-specific knobs for migrating a Snowflake schema into Exasol via `EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL`. Read `flow.md` first for the shared pipeline.
 
-## Required env vars
+Canonical source: `studio/backend/fixtures/migration-scripts/snowflake_to_exasol.sql`.
 
-| Var | Required | Notes |
-|---|---|---|
-| `SNOWFLAKE_USER` | yes | Login name |
-| `SNOWFLAKE_ACCOUNT` | yes | Account locator, e.g. `xy12345.us-east-1`. Strip `.snowflakecomputing.com`. |
-| `SNOWFLAKE_PASSWORD` | if auth_mode=password | Plaintext or env-injected; never log |
-| `SNOWFLAKE_PRIVATE_KEY_PATH` | if auth_mode=key_pair | Path to PEM file (inside the container if running JDBC there — see below) |
-| `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` | if encrypted key | |
-| `SNOWFLAKE_WAREHOUSE` | yes | Compute warehouse to use for source SELECTs. Cost lands on this. |
-| `SNOWFLAKE_ROLE` | recommended | Defaults to user's default role if unset; explicit is safer for reproducibility |
+## Driver preset
 
-Pre-flight check before any IMPORT:
+From `routers/imports.py:DRIVER_PRESETS`:
 
-```bash
-[[ -n "$SNOWFLAKE_USER" && -n "$SNOWFLAKE_ACCOUNT" && -n "$SNOWFLAKE_WAREHOUSE" ]] && \
-  [[ -n "$SNOWFLAKE_PASSWORD" || -n "$SNOWFLAKE_PRIVATE_KEY_PATH" ]] && echo ok
-```
+| Field | Value |
+|---|---|
+| `source_type` | `snowflake` |
+| `driver_name` | `SNOWFLAKE` |
+| `driver_main` | `net.snowflake.client.jdbc.SnowflakeDriver` |
+| `prefix` | `jdbc:snowflake:` |
+| Recommended jar | `snowflake-jdbc-3.22.0.jar` |
+| Older supported | `snowflake-jdbc-3.19.1.jar` |
+
+Driver placement (Docker container mode): `/exa/jdbc/SNOWFLAKE/snowflake-jdbc-3.22.0.jar`.
 
 ## JDBC URL template
 
 ```
-jdbc:snowflake://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/
-  ?warehouse=${SNOWFLAKE_WAREHOUSE}
-  &db=${SOURCE_DATABASE}
-  &schema=${SOURCE_SCHEMA}
-  &role=${SNOWFLAKE_ROLE}
+jdbc:snowflake://<ACCOUNT>.snowflakecomputing.com/?warehouse=<WAREHOUSE>&db=<DB>&schema=<SCHEMA>&role=<ROLE>
 ```
 
-Joined to one line at execution time. The `db` and `schema` parameters set the session context inside Snowflake — STATEMENT SQL can still fully-qualify if needed.
+Single line at exec time. `<ACCOUNT>` is the Snowflake account locator (e.g., `xy12345.us-east-1`) without the `.snowflakecomputing.com` suffix.
 
-For PrivateLink / VPC-only Snowflake accounts:
-
+PrivateLink accounts: substitute the privatelink hostname:
 ```
-jdbc:snowflake://${SNOWFLAKE_ACCOUNT}.privatelink.snowflakecomputing.com/...
-```
-
-User must supply `jdbc_url_override` parameter in that case — agent can't infer the privatelink suffix.
-
-## Auth modes
-
-### password (default)
-
-```sql
-USER 'username'
-IDENTIFIED BY 'password'
+jdbc:snowflake://<ACCOUNT>.privatelink.snowflakecomputing.com/...
 ```
 
-Use for personal dev accounts and demos. Snowflake supports MFA; if enforced on the account, password alone fails — switch to key-pair.
+Skill cannot infer the privatelink suffix — user must supply `jdbc_url` parameter.
 
-### key_pair
+## Credentials
 
-Snowflake's standard service-account pattern. Two-step:
+Required for `CREATE CONNECTION`:
 
-1. Generate key pair (one-time):
-   ```bash
-   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
-   openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
-   ```
-2. Register public key in Snowflake:
-   ```sql
-   ALTER USER svc_acct SET RSA_PUBLIC_KEY='<contents of rsa_key.pub without header/footer>';
-   ```
+| Field | Where it lives |
+|---|---|
+| Snowflake user | `source_user` skill parameter, OR studio CONNECTION_PROFILES |
+| Snowflake password | `source_password` skill parameter (plaintext), OR studio profile (Fernet-encrypted SQLite). Plain text round-trips to `CREATE CONNECTION ... IDENTIFIED BY '<pw>'` which Exasol stores cluster-encrypted. |
+| Warehouse | URL parameter; Snowflake compute warehouse to run source SELECTs against |
+| Role | URL parameter; defaults to user's default if omitted |
 
-JDBC connection appends:
+### Key-pair auth (recommended for service accounts)
 
+Append to JDBC URL:
 ```
 &authenticator=SNOWFLAKE_JWT
-&private_key_file=${SNOWFLAKE_PRIVATE_KEY_PATH}
+&private_key_file=/exa/jdbc-keys/snowflake_key.p8
 ```
 
-Critical: `private_key_file` is a path **inside the Exasol container**, not on the host. The JDBC driver runs in Exasol's JVM, not in the agent's environment. Copy the PEM:
+**Critical**: `private_key_file` is a path **inside the Exasol container**, not on the host. Copy the PEM first:
 
 ```bash
 docker exec exanano-sqlcube mkdir -p /exa/jdbc-keys
@@ -81,120 +61,135 @@ docker cp ./rsa_key.p8 exanano-sqlcube:/exa/jdbc-keys/snowflake_key.p8
 docker exec exanano-sqlcube chmod 600 /exa/jdbc-keys/snowflake_key.p8
 ```
 
-Then set `SNOWFLAKE_PRIVATE_KEY_PATH=/exa/jdbc-keys/snowflake_key.p8` in the agent env.
-
-### oauth / iam — not supported in v0.1
-
-Snowflake OAuth and external-IDP federations require a token broker that the Exasol JDBC layer doesn't expose hooks for. Workaround: pre-fetch a session token outside the agent and pass via `&token=` query param + `&authenticator=OAUTH`. Document as user-handled, don't automate in v0.1.
-
-## Table enumeration
-
-Snowflake INFORMATION_SCHEMA is per-database. STATEMENT SQL:
-
+Then in CREATE CONNECTION:
 ```sql
-SELECT TABLE_NAME, ROW_COUNT
-FROM ${SOURCE_DATABASE}.INFORMATION_SCHEMA.TABLES
-WHERE TABLE_SCHEMA = '${SOURCE_SCHEMA}'
-  AND TABLE_TYPE = 'BASE TABLE'
-ORDER BY TABLE_NAME
+CREATE OR REPLACE CONNECTION "SNOWFLAKE_MIGRATE_..."
+  TO 'jdbc:snowflake://...&authenticator=SNOWFLAKE_JWT&private_key_file=/exa/jdbc-keys/snowflake_key.p8'
+  USER 'svc_acct'
+  IDENTIFIED BY '';     -- password ignored for key-pair, but the clause is required
 ```
 
-`ROW_COUNT` here is Snowflake's cached statistic — usually accurate but can lag for actively-written tables. Acceptable for migration planning. Don't use as source-of-truth for reconciliation; per-table `SELECT COUNT(*)` is authoritative.
+### OAuth / SSO — not supported in v0.1
 
-## Column-level type mapping
+Snowflake OAuth and external-IDP federations need a token broker the studio backend doesn't currently expose. Workaround: pre-fetch a session token outside the agent, pass via `&token=<...>&authenticator=OAUTH` query parameters.
 
-| Snowflake type | Exasol DDL | Notes |
+## SNOWFLAKE_TO_EXASOL parameter contract
+
+Per `studio/backend/fixtures/migration-scripts/snowflake_to_exasol.sql`. Ten positional parameters:
+
+| # | Parameter | Type | Purpose | Skill default |
+|---|---|---|---|---|
+| 1 | `CONNECTION_NAME` | VARCHAR | Pre-created Exasol CONNECTION | `SNOWFLAKE_MIGRATE_<UNIX_TS>` (skill-generated) |
+| 2 | `DB2SCHEMA` | BOOLEAN | If TRUE: flatten `db.schema.table` → Exasol `db_schema.table`. If FALSE: drop the db prefix, use `schema.table` | `FALSE` |
+| 3 | `DB_FILTER` | VARCHAR | Snowflake DB filter. `'%'` for all, `'master'` for exact, `'ma%'` for LIKE, `'first_db, second_db'` for csv list | Required from caller |
+| 4 | `SCHEMA_FILTER` | VARCHAR | Same patterns as DB_FILTER | Required from caller |
+| 5 | `TARGET_SCHEMA` | VARCHAR | Exasol target schema name. Empty string `''` → use source schema name | `target_schema` parameter (defaults to source_schema) |
+| 6 | `TABLE_FILTER` | VARCHAR | Same patterns as DB_FILTER | `'%'` (all tables) |
+| 7 | `IDENTIFIER_CASE_INSENSITIVE` | BOOLEAN | If TRUE: uppercase all identifiers on the Exasol side. If FALSE: preserve source casing | `TRUE` (Exasol's default behavior matches) |
+| 8 | `EXECUTION_MODE` | VARCHAR | `'DEBUG'` (return SQL, don't run) or `'EXECUTE'` | `'EXECUTE'` |
+| 9 | `PARALLEL_CONNECTIONS` | VARCHAR / INT / NULL | Integer N, `'AUTO'` (75% of cluster VCPUs), `'INFO'` (stats only), or NULL (serial) | `'AUTO'` |
+| 10 | `LOGGING_SCHEMA` | VARCHAR / NULL | Schema for JOB_LOG / JOB_DETAILS audit. NULL to disable | `'EXA_DB_MIGRATION'` |
+
+Example invocation:
+
+```sql
+EXECUTE SCRIPT EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL(
+    'SNOWFLAKE_MIGRATE_1715638800',
+    FALSE,
+    'ACME_DEMO',
+    'ADVENTUREWORKS',
+    'ADVENTUREWORKS',
+    '%',
+    TRUE,
+    'EXECUTE',
+    'AUTO',
+    'EXA_DB_MIGRATION'
+);
+```
+
+## Filter pattern syntax
+
+The DB / SCHEMA / TABLE filters share a syntax derived from the migration script:
+
+| Pattern | Meaning |
+|---|---|
+| `'%'` | Match all |
+| `'ADVENTUREWORKS'` | Exact match |
+| `'AW%'` | LIKE pattern — starts with AW |
+| `'%SALES'` | Ends with SALES |
+| `'AW%, SF%'` | CSV list of LIKE patterns (any matches) |
+
+Anything containing `%` is translated to a `LIKE '%'` clause server-side; otherwise the script builds an `IN ('a','b','c')` clause. See lines 117-120 of the script for the parser.
+
+## Type mapping
+
+The Snowflake script handles type mapping internally. Key conversions:
+
+| Snowflake type | Exasol type | Notes |
 |---|---|---|
 | `NUMBER(p,s)` with explicit p,s | `DECIMAL(p,s)` if p≤36 | Exasol DECIMAL max precision is 36 |
-| `NUMBER(p,s)` p>36 | `DECIMAL(36,s)` | Lossy; log warning to manifest |
-| `NUMBER` no params | `DECIMAL(36,18)` | Snowflake default is 38,0 — we downsize to fit |
+| `NUMBER(p,s)` p>36 | `DECIMAL(36,s)` | Truncated; warning in JOB_DETAILS |
+| `NUMBER` no params | `DECIMAL(36,18)` | Snowflake default is 38,0 |
 | `FLOAT` / `DOUBLE` / `REAL` | `DOUBLE PRECISION` | |
 | `VARCHAR(n)` n≤2000000 | `VARCHAR(n)` | |
-| `VARCHAR(n)` n>2000000 | `VARCHAR(2000000)` | Exasol cap; log warning if data actually exceeds |
-| `STRING` / `TEXT` | `VARCHAR(2000000)` | Snowflake STRING is unbounded → use Exasol max |
-| `CHAR(n)` | `CHAR(n)` | Up to 2000 in Exasol |
+| `VARCHAR(n)` n>2000000 | `VARCHAR(2000000)` | Exasol cap |
+| `STRING` / `TEXT` | `VARCHAR(2000000)` | Unbounded → max |
 | `BOOLEAN` | `BOOLEAN` | |
 | `DATE` | `DATE` | |
-| `TIME` | `VARCHAR(20)` | Exasol has no TIME-only type; encode as text or compose with DATE |
-| `TIMESTAMP_NTZ` | `TIMESTAMP` | Direct |
-| `TIMESTAMP_LTZ` / `TIMESTAMP_TZ` | `TIMESTAMP` | Converted to UTC; log to manifest |
-| `VARIANT` / `OBJECT` / `ARRAY` | `VARCHAR(2000000)` | Semi-structured stays as JSON text |
-| `BINARY` / `VARBINARY` | — | Skip with manifest warning (no Exasol BLOB) |
+| `TIME` | `VARCHAR(20)` | No Exasol TIME-only type |
+| `TIMESTAMP_NTZ` | `TIMESTAMP` | |
+| `TIMESTAMP_LTZ` / `TIMESTAMP_TZ` | `TIMESTAMP` | Converted to UTC; logged |
+| `VARIANT` / `OBJECT` / `ARRAY` | `VARCHAR(2000000)` | JSON text |
+| `BINARY` / `VARBINARY` | — | Skipped with warning (no Exasol BLOB) |
 | `GEOGRAPHY` / `GEOMETRY` | `VARCHAR(2000000)` | WKT representation |
-| `VECTOR(n)` | `VARCHAR(2000000)` | Serialize as text array; lossy for ANN ops downstream |
-
-Column-list query for one table:
-
-```sql
-SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE,
-       CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-FROM ${SOURCE_DATABASE}.INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = '${SOURCE_SCHEMA}'
-  AND TABLE_NAME = '${TABLE}'
-ORDER BY ORDINAL_POSITION
-```
+| `VECTOR(n)` | `VARCHAR(2000000)` | Serialized as text array |
 
 ## STATEMENT pushdown
 
-Snowflake handles ANSI SQL plus extensions. Safe to push:
+The script generates `STATEMENT 'SELECT * FROM <DB>.<SCHEMA>.<TABLE>'` per table. To restrict columns or rows, pass a custom STATEMENT — but the SNOWFLAKE_TO_EXASOL script doesn't expose this directly. Workarounds:
 
-- `SELECT col1, col2 FROM ...` — projection
-- `WHERE` predicates
-- `LIMIT n` — used for `sample_only=true`
-- `ORDER BY` — but expensive in Snowflake, skip unless caller asks
-- `QUALIFY` — Snowflake-specific, fine since source-side
-
-Avoid:
-
-- `WITH RECURSIVE` — query planner difference, IMPORT round-trip times out
-- Snowflake stored procedures / UDFs in the SELECT — they execute in Snowflake but error surfaces are opaque through JDBC
-
-## Driver
-
-Maven Central:
-
-```
-net.snowflake:snowflake-jdbc:3.14.5
-```
-
-(Pin a known-good version; latest may break against older Exasol JVM.)
-
-Placement: `/exa/jdbc/SNOWFLAKE/snowflake-jdbc-3.14.5.jar` inside the container. See `exasol-nano-local/jdbc-drivers.md`.
+- **DEBUG mode + manual edit**: `EXECUTION_MODE='DEBUG'`, capture the generated SQL, modify, run manually.
+- **Source-side views**: Create a Snowflake view that projects/filters, then point the filter at the view name.
 
 ## Cost notice
 
-The compute warehouse named in `SNOWFLAKE_WAREHOUSE` runs during the migration. Time = warehouse cost. For TPCH SF1 (~12M rows, 8 tables) on an X-Small: ~5 min, ~$0.30. For TPCH SF100: ~45 min on Medium, several dollars. The skill SHOULD surface this estimate during step 6 (plan presentation) when source size is known:
+`PARALLEL_CONNECTIONS=AUTO` fires multiple concurrent IMPORTs against the Snowflake warehouse. The warehouse runs for the duration of the migration; compute cost lands on `<WAREHOUSE>`.
+
+For TPCH SF1 (~12M rows, 8 tables) on an X-Small: ~5 min, ~$0.30. For TPCH SF100: ~45 min on Medium, several dollars.
+
+The skill SHOULD surface this estimate during plan-presentation:
 
 ```
 Source size: ~6 GB compressed
 Estimated Snowflake compute cost: ~$0.50 (X-Small warehouse, 5 min)
+PARALLEL_CONNECTIONS=AUTO → ~8 concurrent IMPORTs
 Proceed?
 ```
-
-Don't hide cost. Users with a corporate Snowflake bill care.
 
 ## Known failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `390100: Incorrect username or password` | Bad creds | Re-verify env vars |
-| `390114: Authentication token has expired` | OAuth/JWT staleness | Re-fetch token (see auth_mode notes) |
-| `391701: Network policy ... blocked` | Snowflake account network policy excludes the container's egress IP | Add IP to allowlist, or use jdbc_url_override with PrivateLink |
-| `JDBC driver internal error: Cannot acquire warehouse` | Suspended warehouse and account lacks AUTO_RESUME privilege | `ALTER WAREHOUSE <WH> RESUME` from Snowflake side first |
+| `390100: Incorrect username or password` | Bad creds in CREATE CONNECTION | Re-check source_user / source_password |
+| `390114: Authentication token has expired` | OAuth / JWT staleness | Re-fetch token, re-create connection |
+| `391701: Network policy blocked` | Snowflake account network policy excludes the cluster's egress IP | Add IP to allowlist OR use PrivateLink jdbc_url |
+| `JDBC driver internal error: Cannot acquire warehouse` | Suspended warehouse, AUTO_RESUME not granted | `ALTER WAREHOUSE <WH> RESUME` from Snowflake side first |
 | `Object does not exist or operation cannot be performed` | Role lacks USAGE on schema | `GRANT USAGE ON SCHEMA ... TO ROLE` |
-| Timeout on large table | Default IMPORT timeout (10 min) hit | Split via include_tables, or set Exasol `STATEMENT_TIMEOUT_MS` higher |
+| Migration starts then aborts at first IMPORT | `EXA_DB_MIGRATION.QUERY_WRAPPER` missing | `EXECUTE SCRIPT` against `studio/backend/fixtures/migration-scripts/query_wrapper.sql` OR `scripts_library.install_fixture("migration-scripts")` |
+| JOB_LOG.STATUS=FAILED but some tables imported | Per-table error — check JOB_DETAILS WHERE LOG_LEVEL='ERROR' | Inspect, fix root cause (often type-out-of-range or NULL on NOT NULL), re-run with TABLE_FILTER narrowed |
 
-## ACME_DEMO.adventureworks sample path (oneshot-tour fixture)
+## ACME_DEMO.adventureworks fixture path (`/oneshot-tour` demo)
 
 For the `/oneshot-tour` demo, the canonical input is:
 
 ```
-source_vendor = snowflake
-source_database = ACME_DEMO
-source_schema = ADVENTUREWORKS
-target_schema = ADVENTUREWORKS
+source_type     = snowflake
+source_db       = ACME_DEMO            (→ DB_FILTER)
+source_schema   = ADVENTUREWORKS       (→ SCHEMA_FILTER)
+target_schema   = ADVENTUREWORKS
+table_filter    = '%'
 ```
 
-User pre-sets the env vars referenced above (or has them in `.env`). Skill auto-runs through the pipeline, manifest lands in current working directory.
+User pre-sets credentials (skill parameters, or studio CONNECTION_PROFILES). Skill auto-generates connection name, runs SNOWFLAKE_TO_EXASOL with EXECUTION_MODE=EXECUTE, polls JOB_LOG, drops connection on completion.
 
-Default warehouse for that demo: `DEMO_WH` on X-Small. Expected duration: 2–4 min.
+Default warehouse: `DEMO_WH` on X-Small. Expected duration: 2–4 min.
