@@ -34,16 +34,22 @@ The recipe in `exanano-local-runtime.md` walks through:
    ```bash
    docker run -d \
      --name exanano-sqlcube \
+     --shm-size=4g \
      -p 8564:8563 \
-     -p 8444:443 \
+     -p 8444:8443 \
      -v exanano_sqlcube:/exa \
-     -e EXA_PASSWORD=exasol \
-     --privileged \
-     exasol/docker-db:8.34.0
+     exasol/nano:latest \
+     --provision-stacks java
    ```
+   (Matches the canonical command in `docs/ops/exanano-local-runtime.md`. Image is `exasol/nano:latest`, not the heavier `docker-db`. `--shm-size=4g` is required.)
 5. **Wait for first-boot initialization** (~2 minutes the first time — provisions system catalog, license, default schemas).
 6. **Verify** via `exapump sql -p sqlcube-nano "SELECT CURRENT_USER"`.
-7. **(Optional) Drop JDBC drivers** if upstream skills need them (see `jdbc-drivers.md`).
+7. **Run the SQLCube schema bootstrap.** Not automatic on container start. Run:
+   ```bash
+   python3 scripts/deploy_adapter_exanano.py
+   ```
+   from the `exasol-factory-foundation` checkout. Creates `SQLCUBE`, `SQLCUBE_REGISTRY`, and the AdventureWorks fixture. `SQLCUBE_META` is a separate bootstrap, fired by the studio backend's lineage endpoint or directly via `studio/backend/fixtures/sqlcube-meta/bootstrap.sql`.
+8. **(Optional) Drop JDBC drivers** if upstream skills need them (see `jdbc-drivers.md`).
 
 ## What the agent should do
 

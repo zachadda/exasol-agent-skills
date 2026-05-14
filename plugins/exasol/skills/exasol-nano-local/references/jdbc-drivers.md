@@ -4,21 +4,28 @@ How to place a JDBC driver so `IMPORT FROM JDBC` and federated queries reach ext
 
 ## Where drivers live
 
-Inside the container:
+The studio backend's `bucketfs.py` chooses one of four placements based on runtime mode (see `studio/backend/services/bucketfs.py:_preferred_source_dir()`):
+
+| Mode | Path | When |
+|---|---|---|
+| **Docker container** (most common — `exanano-sqlcube`) | `/exa/jdbc/<VENDOR_UPPER>/` inside container | `EXA_NANO_CONTAINER_NAME` env var set; this is the default for the dev Nano |
+| **Native local** (legacy `exanano` binary, no Docker) | `~/.exanano/jdbc/<VENDOR_UPPER>/` on host | Native Nano binary in use |
+| **Local filesystem** (configured root) | `<configured-root>/<source_type>/` | Studio-managed local-runtime mode |
+| **BucketFS** (production-style) | `<exa_bucketfs_url>/<import_path>/<source_type>/` | Remote Exasol clusters; uploaded via HTTP PUT |
+
+For this skill's primary target (`exanano-sqlcube` Docker container), the first row applies: `/exa/jdbc/<VENDOR_UPPER>/`.
+
+Examples (container mode):
 
 ```
-/exa/jdbc/<VENDOR_UPPER>/
-```
-
-One subdirectory per vendor. Examples:
-
-```
-/exa/jdbc/SNOWFLAKE/snowflake-jdbc-3.14.5.jar
-/exa/jdbc/POSTGRES/postgresql-42.7.3.jar
+/exa/jdbc/SNOWFLAKE/snowflake-jdbc-3.22.0.jar
+/exa/jdbc/POSTGRES/postgresql-42.7.5.jar
 /exa/jdbc/MYSQL/mysql-connector-j-8.4.0.jar
 ```
 
-`<VENDOR_UPPER>` is uppercase by convention and matches the value the agent will reference in `IMPORT FROM JDBC AT '...' SOURCE_TYPE = 'JDBC' ...` calls. The Exasol JVM scans `/exa/jdbc/*/*.jar` at process startup. New jars need a container restart.
+`<VENDOR_UPPER>` is uppercase by convention and matches the driver-key from the studio's `DRIVER_PRESETS` dictionary (see `studio/backend/services/drivers.py`). The Exasol JVM scans `/exa/jdbc/*/*.jar` at process startup. New jars need a container restart.
+
+Casing matters: the studio's `_preferred_source_dir()` explicitly uppercases for ExaNano (container) mode but preserves case for other targets. Don't mix.
 
 ## Why this path
 

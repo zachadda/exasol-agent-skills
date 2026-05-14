@@ -48,6 +48,24 @@ SYS
 
 If profile missing → `exapump: profile 'sqlcube-nano' not found`. Append the block above to `~/.exapump/config.toml`. If file doesn't exist, create it with that block as the only content.
 
+### Alternative: env-var / DSN-flag
+
+`exapump` also accepts environment variables OR an explicit DSN URI flag. Useful for ephemeral sessions, CI jobs, or when a user doesn't have a `~/.exapump/config.toml`:
+
+```bash
+# Env-var form (matches what factory-foundation scripts/benchmarks use):
+EXA_HOST=localhost:8564 \
+EXA_USER=sys \
+EXA_PASSWORD=exasol \
+exapump sql "SELECT CURRENT_USER"
+
+# DSN-flag form:
+exapump sql -d 'exasol://sys:exasol@localhost:8564?tls=true&validateservercertificate=false' \
+  "SELECT CURRENT_USER"
+```
+
+The studio backend uses env-var-driven connections internally (see `studio/backend/config.py`); the TOML profile is a user-level convenience layer. Either path works against the same Nano.
+
 ## pyexasol
 
 ```python
