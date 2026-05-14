@@ -10,10 +10,13 @@ Use the `exasol-query-personas` skill — this file just documents the narration
 SELECT "Sales Territory Country",
        SUM("Sales Amount") AS "Total Sales"
 FROM "SQLCUBE_ACME_ADVENTUREWORKS"."internet_sales"
+GROUP BY 1
 ORDER BY 2 DESC
 ```
 
 (Sorted DESC so the variation shows up in the first visible row. No LIMIT — let the row count tell the RCLS story.)
+
+**Must use `GROUP BY 1`** when the SELECT mixes a bare dim column with a wrapped `SUM(...)` measure. Without it, Exasol errors `not a single-group group function` — verified live during the 2026-05-14 rehearsal. Alternative (cube adapter-native shape): drop the `SUM()` wrap entirely and let the adapter auto-group, but the GROUP BY 1 form mirrors the GUI's `/api/query/build` output and parses everywhere.
 
 ## Render
 

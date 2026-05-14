@@ -14,10 +14,12 @@ For the canonical Maglev Tour demo against `exanano-demo-tour`, defaults in the 
 Detect via:
 
 ```sql
+-- Note: CUBE is reserved in Exasol (verified live against SYS.EXA_SQL_KEYWORDS).
+-- Bare `AS cube` errors with `syntax error, unexpected CUBE_`. Quote it.
 SELECT
-  (SELECT COUNT(*) FROM SYS.EXA_SCHEMAS WHERE SCHEMA_NAME = 'ACME_ADVENTUREWORKS')                AS migrated,
-  (SELECT COUNT(*) FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'SQLCUBE_ACME_ADVENTUREWORKS') AS cube,
-  (SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES WHERE MODEL_ID = 'internet_sales')     AS rcls;
+  (SELECT COUNT(*) FROM SYS.EXA_SCHEMAS WHERE SCHEMA_NAME = 'ACME_ADVENTUREWORKS')                AS "migrated",
+  (SELECT COUNT(*) FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'SQLCUBE_ACME_ADVENTUREWORKS') AS "cube",
+  (SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES WHERE MODEL_ID = 'internet_sales')     AS "rcls";
 ```
 
 3-of-3 → warm. 0-of-3 → cold. Anything else → mid.

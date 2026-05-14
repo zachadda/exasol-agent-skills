@@ -35,8 +35,9 @@ parameters:
         default: |
           SELECT "Sales Territory Country", SUM("Sales Amount") AS "Total Sales"
           FROM "<virtual_schema>"."<model_id>"
+          GROUP BY 1
           ORDER BY 2 DESC
-        doc: "Query to run as each persona. Default reveals the RCLS predicate cleanly via country breakdown."
+        doc: "Query to run as each persona. Default reveals the RCLS predicate cleanly via country breakdown. The explicit `GROUP BY 1` is required — wrapping the measure in SUM() while listing a bare dim column otherwise errors `not a single-group group function` (live-verified 2026-05-14)."
     - studio_base_url:
         default: "http://127.0.0.1:8002"
 
@@ -86,6 +87,7 @@ personas = ["SYS", "RCLS_CANADA", "RCLS_EUROPE", "RCLS_EXEC"]
 sql = '''
   SELECT "Sales Territory Country", SUM("Sales Amount") AS "Total Sales"
   FROM "SQLCUBE_ACME_ADVENTUREWORKS"."internet_sales"
+  GROUP BY 1
   ORDER BY 2 DESC
 '''
 ```
