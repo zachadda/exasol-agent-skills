@@ -36,26 +36,36 @@ WHERE FACT_SCHEMA = :source_schema
 ORDER BY MODEL_ID
 LIMIT 1;
 
--- 3. Pull one numeric measure on that model
+-- 3. Pull one numeric measure on that model.
+--    IS_VISIBLE = TRUE is required — the SQLCube adapter only projects visible
+--    columns onto the virtual schema. Registry rows with IS_VISIBLE=FALSE exist
+--    but won't appear in the virtual schema and a query against them errors
+--    `object <col> not found`.
 SELECT VIRTUAL_COL, AGG_TYPE
 FROM SQLCUBE_REGISTRY.MEASURES
 WHERE MODEL_ID = :model_id
+  AND IS_VISIBLE = TRUE
   AND AGG_TYPE IN ('SUM', 'COUNT', 'COUNT_DISTINCT', 'AVG')
 ORDER BY MEASURE_ID
 LIMIT 1;
 
--- 4. Pull one date-shaped dim on that model (DATA_TYPE LIKE 'DATE%' or DIMENSIONS row mapped to a date col)
+-- 4. Pull one date-shaped visible dim on that model.
 SELECT VIRTUAL_COL
 FROM SQLCUBE_REGISTRY.DIMENSIONS
 WHERE MODEL_ID = :model_id
+  AND IS_VISIBLE = TRUE
   AND (UPPER(DATA_TYPE) LIKE 'DATE%' OR UPPER(DATA_TYPE) LIKE 'TIMESTAMP%')
 ORDER BY DIM_ID
 LIMIT 1;
 
--- 5. Compose + run sample query (note: MODEL_ID and VIRTUAL_COL are case-preserving — quote them)
+-- 5. Compose + run sample query.
+--    Both `MODEL_ID` and `VIRTUAL_COL` are case-preserving — quote them.
+--    Quote the result aliases too: `value` is a reserved keyword in Exasol
+--    (ISO SQL), so `AS value` parses as a syntax error. Use `AS "value"` or a
+--    non-reserved alias like `AS "amount"` / `AS "bucket"`.
 SELECT
-  "<dim_virtual_col>"          AS bucket,
-  <agg_type>("<measure_virtual_col>") AS value
+  "<dim_virtual_col>"                   AS "bucket",
+  <agg_type>("<measure_virtual_col>")   AS "amount"
 FROM "<target_cube_name>"."<model_id>"
 GROUP BY 1
 ORDER BY 1
@@ -87,7 +97,7 @@ agent:
     tool: SQLCUBE_REGISTRY.DIMENSIONS → "Calendar Year" (DECIMAL)
     tool: Sample query:
 
-      SELECT "Calendar Year", SUM("Sales Amount") AS "Sales Amount"
+      SELECT "Calendar Year" AS "bucket", SUM("Sales Amount") AS "amount"
       FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
       GROUP BY 1 ORDER BY 1 LIMIT 10;
 
@@ -121,8 +131,8 @@ tour_state:
     dim_virtual_col: "Calendar Year"
     measure_virtual_col: "Sales Amount"
     agg_type:        SUM
-    sql:             "SELECT \"Calendar Year\", SUM(\"Sales Amount\") ..."
-    columns:         ["Calendar Year", "Sales Amount"]
+    sql:             "SELECT \"Calendar Year\" AS \"bucket\", SUM(\"Sales Amount\") AS \"amount\" ..."
+    columns:         ["bucket", "amount"]
     rows:
       - [2010,       43421.04]
       - [2011,    7075439.06]
@@ -136,7 +146,9 @@ tour_state:
 |---|---|
 | `SYS.EXA_VIRTUAL_SCHEMAS` returns no row | "Virtual schema didn't materialize. Cube create reported success but catalog says otherwise. Re-run step 5 in step_by_step mode." |
 | `SQLCUBE_REGISTRY.MODELS` empty for FACT_SCHEMA | "Virtual schema is live but no MODEL was registered. Semantic-layer skill misbehaved." |
-| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script) |
+| `SQLCUBE_REGISTRY.MEASURES` has rows but none with `IS_VISIBLE = TRUE` | "Model `<id>` has measures registered but all are hidden. Re-run step 5 with `llm_enrichment: true`, or update IS_VISIBLE on at least one measure." |
+| `SQLCUBE_REGISTRY.DIMENSIONS` has rows but none with `IS_VISIBLE = TRUE` | Same as above for dims. Pick `COUNT(*)` as the measure and report "no visible dims; verified at fact-row-count level only". |
+| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script). Common cause: unquoted reserved-keyword alias (e.g. `AS value` instead of `AS "value"`). |
 | Sample query returns 0 rows | "Cube is live but query returned no rows. Possible model error: dim/measure don't connect to facts. Inspect `SQLCUBE_REGISTRY.JOINS` for the model." |
 
 On halt, Phase 5 does NOT run. Tour ends without a dashboard.
