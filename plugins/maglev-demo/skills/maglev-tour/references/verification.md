@@ -11,10 +11,15 @@ WHERE SCHEMA_NAME = 'SQLCUBE_ACME_ADVENTUREWORKS'
   AND ADAPTER_SCRIPT_SCHEMA = 'SQLCUBE'
   AND ADAPTER_SCRIPT_NAME = 'ADAPTER';
 
--- 2. rcls_seeded
+-- 2a. rcls_row_seeded
 SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES
 WHERE MODEL_ID = 'internet_sales';
--- Expect 4.
+-- Expect 4 (SYS + 3 RCLS personas).
+
+-- 2b. rcls_attribute_seeded (column masks)
+SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ATTRIBUTE_POLICIES
+WHERE MODEL_ID = 'internet_sales';
+-- Expect 2 (GROSS_MARGIN DENY for RCLS_CANADA + RCLS_EUROPE).
 
 -- 3. data round-trip
 SELECT COUNT(*)

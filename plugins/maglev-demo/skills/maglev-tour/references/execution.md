@@ -146,13 +146,16 @@ Six sub-calls in order. Each is owned by `exasol-semantic-layer` — see its `re
    }
    → SqlcubeModel with 4 domains (atomic + by_month + by_product + by_month_product), ~140 attrs
 
-5. POST /api/sqlcube/apply-metric-pack    (** Maglev Tour-specific **)
-   Body: { source_schema, domains, attributes, pack_name: null }
-   → auto-detects 'adventureworks' pack when source_schema matches, returns enriched attributes
-     (Gross Profit, Gross Margin Pct, Distinct Customer/Product counts, weighted Unit Price
-     corrections). All injected attrs land with is_visible=true (overrides validator ranking).
+5. **Sanitize attributes** (client-side step — matches GUI `sanitizeGeneratedModelAttributes` in `studio/frontend/src/components/panels/CubeCreatorPanel.jsx:1953`).
+   For each `metric_agg` attribute: if `formula` is a bare aggregate keyword (`"SUM"`, `"COUNT"`, etc.), move it into `agg_function` and null the formula. If `formula` is a simple fact-column reference (`"f.SALESAMOUNT"`), move it into `physical_col`.
+   For each `metric_calc` attribute with a bare-aggregate `formula`: convert to `metric_agg` if there's a `physical_col`, else **drop the attribute** with a `dropped_bare_metric_calc` warning.
+   Returns `{attributes, warnings, infos}`. The agent must apply this BEFORE metric-pack — otherwise validator at deploy-time will reject bare-aggregate formulas.
 
-6. POST /api/deploy/execute
+6. POST /api/sqlcube/apply-metric-pack    (** Maglev Tour-specific **)
+   Body: { source_schema, domains, attributes, pack_name: null }
+   → auto-detects 'adventureworks' pack when any `domain_id` contains `internet_sales`, adds 4 attrs per domain (`gross_profit`, `gross_margin_pct`, `distinct_customer_count`, `distinct_product_count`) + replaces UNIT_PRICE-family metric_agg with weighted metric_calc. All injected attrs land with `is_visible=true` (overrides validator ranking). For 4 domains: +16 net new attrs.
+
+7. POST /api/deploy/execute
    Body: {
      source_schema,
      domains,

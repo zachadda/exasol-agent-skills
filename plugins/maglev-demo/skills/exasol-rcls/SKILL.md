@@ -76,12 +76,21 @@ Returns: {
   "model_id": "internet_sales",
   "current_user": "SYS",
   "apply_required": false,
-  "created_row_policies": [ ... 4 rows ... ],
-  "created_attribute_policies": [],
+  "created_row_policies": [ ... 4 ALLOW rows, one per persona ... ],
+  "created_attribute_policies": [ ... 2 DENY rows: GROSS_MARGIN for RCLS_CANADA + RCLS_EUROPE ... ],
   "demo_scenarios": [ ... metadata for UI ... ],
-  "message": "..."
+  "message": "Demo users and policies seeded; virtual schema refreshed."
 }
 ```
+
+Per `services/runtime_registry.py:seed_demo_policies`, the endpoint walks every entry in `DEMO_RCLS_SCENARIOS` and for each:
+
+1. Ensures Exasol user exists with the canonical password (`RclsDemo1!`).
+2. Grants USAGE + SELECT on the virtual schema + every SQLCUBE_REGISTRY table.
+3. Writes the row predicate via `create_row_policy` (ALLOW).
+4. For each name in `scenario["hidden_attributes"]`, writes an `RCLS_ATTRIBUTE_POLICIES` row via `create_attribute_policy` (DENY).
+
+Live-verified shape: 4 row policies (SYS + 3 RCLS users) + 2 attribute policies (`GROSS_MARGIN` hidden from `RCLS_CANADA` and `RCLS_EUROPE`).
 
 The endpoint is **idempotent** — re-running against an already-seeded domain returns success with the existing policy set; user creation is skipped if present.
 
@@ -173,5 +182,5 @@ Even with FKs and grants right, the adapter's `adapterNotes` cache survives sess
 ## Limitations
 
 - v0.1 is the canonical four-persona demo only. Custom personas require `POST /api/browser/security/row-policies` direct usage.
-- ATTRIBUTE policies (column-level masking) are NOT seeded by this skill — `created_attribute_policies` returns `[]`. Use `POST /api/browser/security/attribute-policies` for that.
+- ATTRIBUTE policies (column-level masking) ARE seeded by this skill — `GROSS_MARGIN` is hidden from `RCLS_CANADA` + `RCLS_EUROPE` per `DEMO_RCLS_SCENARIOS["hidden_attributes"]`. For custom column masks beyond the demo defaults, use `POST /api/browser/security/attribute-policies` directly.
 - Adapter caches metadata per-virtual-schema. Re-seeding after the user has run a query in the current session may require a fresh connection for the new policies to fire — `ALTER VIRTUAL SCHEMA REFRESH` clears the server-side cache but not pyexasol's client buffer.

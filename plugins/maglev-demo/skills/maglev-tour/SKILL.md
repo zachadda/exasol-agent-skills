@@ -125,7 +125,7 @@ Five phases (Maglev Tour GUI matches this — sub-step grouping):
 - **demo-tour container is the canonical fixture.** Port 8568, container `exanano-demo-tour`. Snowflake CONNECTION and migration scripts pre-seeded. If running against a different container, expect Phase 1-3 to require additional setup.
 - **Re-runs are idempotent.** `seed-demo` upserts; `/deploy/execute` drop+creates virtual schema; `optimize/run-sql` catches "already exists" errors. Safe to re-invoke the whole tour against demo-tour without state corruption.
 - **GUI parity over invention.** When the skill must choose between a "cleaner" agent path and one that mirrors `FactoryTour.jsx`, prefer GUI parity — the boss is watching for "this is the same demo, just driven differently."
-- **AI narration is real LLM, not pre-baked.** GUI uses `factoryDemoLLM.js` pre-baked transcripts because it has no agent. The agent IS the LLM — narrate via TaskUpdate text, not a `factoryDemoLLM.js` stub.
+- **AI narration is real LLM, not pre-baked. The agent path beats the GUI here.** GUI's `factoryDemoLLM.js` ships static `OPTIMIZE_AI_TRANSCRIPT` + `CUBE_AI_TRANSCRIPT` strings + pre-authored `OPTIMIZE_AI_RECS` / `CUBE_AI_RECS` arrays (Flatten DIMPRODUCT snowflake, Role-play DIMDATE, Junk dim, AVG_ORDER_VALUE, GROSS_MARGIN_PCT, Grain-lock, Snowflake-hop). The GUI does NOT call an LLM in either step — the cards are static. The agent IS the LLM, so the agent's AI narration is real analysis of the actual UDF findings + parsed_ddl. Demo wins on "the AI is really thinking" because — in the agent path — it really is.
 
 ## Related skills
 
