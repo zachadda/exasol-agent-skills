@@ -91,6 +91,7 @@ Halt and surface a clear message to the user when:
 1. Any precondition check fails after the upstream skill ran.
 2. Any tool call returns a non-recoverable error.
 3. The verification SELECT (`provides: cube_live`) returns zero rows.
+4. **Between Step 4 and Step 5: `EXA_OPTIMIZE.INFER_JOIN_PATHS('<source_schema>')` returns zero rows.** No declared FKs and no name-stem matches found a fact↔dim link, so the cube would have only fact-table measures and no dim attributes. Halt with a clear diagnosis — don't silently proceed to a cube build that produces an empty / fact-only result the user won't understand. Suggested next moves: (a) declare FKs via `ANALYZE_CONSTRAINTS` + `DRY_RUN_PLAN`; (b) rename PKs on the dim side to share a stem with fact FK columns; (c) accept a fact-only cube and proceed manually. Live-verified 2026-05-14 against the `INVENTORY` fixture (7 tables, no FKs, no FACT-prefix names, no stem match → 0 joins). See `exasol-semantic-layer/references/deploy-flow.md` step 3 halt-gate.
 
 On halt, the agent must:
 - Report which step failed and the actual error.
