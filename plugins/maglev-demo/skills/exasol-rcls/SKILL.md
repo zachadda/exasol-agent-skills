@@ -26,7 +26,7 @@ provides:
 parameters:
   required:
     - model_id:
-        doc: "Target domain / model id. For the canonical Factory Tour demo: 'internet_sales'."
+        doc: "Target domain / model id. For the canonical Maglev Tour demo: 'internet_sales'."
   optional:
     - studio_base_url:
         default: "http://127.0.0.1:8002"
@@ -45,7 +45,7 @@ Row-level cube security via the SQLCube adapter's RCLS pushdown. Wraps the studi
 ## When to trigger
 
 - User asks to "seed RCLS", "set up row-level security", "create demo personas", "wire up Canada/Europe/Exec users".
-- `/factory-tour` orchestrator at Phase 7.
+- `/maglev-tour` orchestrator at Phase 7.
 
 Do NOT trigger for ad-hoc security policy work — use `POST /api/browser/security/row-policies` directly for custom predicates.
 
@@ -125,12 +125,45 @@ Then hand off to `exasol-query-personas` for the actual persona-switch demonstra
 
 ## Adapter mechanics (worth knowing)
 
-The Lua adapter at `sqlcube/adapter/metadata_registry.lua` reads `RCLS_ROW_POLICIES` once per query, filters by `CURRENT_USER`, AND-joins the matching predicate to the generated SQL's WHERE clause. Two failure modes the FACTORY_TOUR_DEMO_PATH doc calls out:
+The Lua adapter at `sqlcube/adapter/metadata_registry.lua` reads `RCLS_ROW_POLICIES` once per query (cached in `adapterNotes`), filters by `CURRENT_USER`, OR-joins the matching ALLOW predicates, rewrites business names to physical columns via `rewrite_semantic_predicate`, and AND-joins the result into the pushdown SQL's WHERE clause.
 
-1. **Missing grants on `RCLS_ROW_POLICIES`** → adapter sees an empty result set → no policy applies → query returns all rows → silent security bypass. Always re-grant after table changes.
-2. **Predicate references a dim attribute the cube doesn't expose** → adapter can't translate the business name to a physical column → query emits the literal "Sales Territory Country" → Exasol fails "column not found". Ensure DIMSALESTERRITORY is in the cube's join graph before seeding.
+## The three-layer bug (post-mortem — `exasol-zemantic-layer/MAGLEV_RCLS_DEEP_DIVE.md`)
 
-The skill's idempotent re-run includes the `ALTER VIRTUAL SCHEMA REFRESH` so the adapter drops cached metadata; without that the new policies wouldn't apply until the next adapter restart.
+These three issues stacked on each other in the GUI demo. All three patches must hold for RCLS to actually enforce. The current `seed-demo` endpoint embeds patches B + C; patch A lives in the upstream Tour Optimize step.
+
+### 1. ANALYZE_CONSTRAINTS only emits FK ADDs after value-match validation
+
+Hardened `analyze_constraints.sql` suggests a FK only when (a) candidate FK column matches by name, (b) target dim already has a PK on the matching column (so value-match can run), (c) ≥99% of fact rows match. On a fresh post-migrate schema there are zero PKs — first pass adds PKs + ~3 high-confidence FKs only. **Without a second analyze pass after PKs land**, ~5 FKs stay silent — DIMSALESTERRITORY among them. Cube introspection sees no FK → no join → "Sales Territory Country" attr never lands in `model_meta.columns` → adapter's `rewrite_semantic_predicate` can't translate → ships literal `"Sales Territory Country"` to Exasol → `object not found` error at query time.
+
+**Fix**: Two-pass optimize in the Tour's Step 5. See `maglev-tour/references/execution.md`. Apply is idempotent — on `"constraint already used"` parse the name, DROP CONSTRAINT, retry ADD.
+
+### 2. Adapter cache load runs AS the impersonated user → without grants, silently empty
+
+Adapter caches `model_meta` (including row_policies) in `adapterNotes` on first pushdown per session. The cache-load query `SELECT * FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES WHERE MODEL_ID=...` runs as `CURRENT_USER` — `RCLS_CANADA` (or whichever persona). Without `GRANT SELECT` on registry tables to that user, the query returns empty silently, the adapter caches an empty policy list, predicate reduces to `1=1`, and every persona sees every row.
+
+**Most insidious failure mode** — seed reports success (rows ARE in `RCLS_ROW_POLICIES`), but enforcement doesn't happen. Discoverable only by querying as a persona and noticing identical row counts.
+
+**Fix**: `seed_demo_policies` grants `SELECT` on every `SQLCUBE_REGISTRY.*` table (`ATTRIBUTES`, `DIMENSIONS`, `MEASURES`, `DERIVED_MEASURES`, `MODELS`, `JOINS`, `RCLS_ROW_POLICIES`, `RCLS_ATTRIBUTE_POLICIES`) to each persona. In `services/runtime_registry.py:_grant_virtual_schema_access`.
+
+### 3. Adapter caches model_meta — new policies need `ALTER VIRTUAL SCHEMA REFRESH`
+
+Even with FKs and grants right, the adapter's `adapterNotes` cache survives session boundaries. Re-running seed writes new policy rows but the next query still hits the cached empty (or stale) policy set until something invalidates the cache.
+
+**Fix**: `ALTER VIRTUAL SCHEMA "<vs>" REFRESH` at end of `seed_demo_policies`. Drops cache; next pushdown rebuilds from the registry.
+
+## Symptom → cause cheat sheet
+
+| Symptom | Likely cause | Confirm |
+|---|---|---|
+| `object "Sales Territory Country" not found` in pushdown | DIMSALESTERRITORY missing from cube | `SELECT PHYSICAL_TABLE, COUNT(*) FROM SQLCUBE_REGISTRY.ATTRIBUTES WHERE DOMAIN_ID='internet_sales' AND ATTR_TYPE='dimension' GROUP BY 1` — should list 8 dim tables |
+| All four personas return identical row counts | Adapter can't read policies as demo user | Run `SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES` with `execution_user='RCLS_CANADA'` via `/api/query/execute` — 401 or empty result means Patch B regressed |
+| New seed didn't take effect | Stale adapter cache | Manually `ALTER VIRTUAL SCHEMA "SQLCUBE_..." REFRESH` and retest; if that fixes it, Patch C regressed |
+| Seed reports `success: true` but enforcement wrong | Order of operations | Cube must deploy BEFORE seed. Never the reverse — the virtual schema must exist for REFRESH and the registry tables must exist for grants. |
+
+## Adjacent traps that look like RCLS bugs
+
+- `EXA_ALL_CONSTRAINTS WHERE CONSTRAINT_TYPE='FOREIGN KEY'` can return 0 rows even when FKs exist — catalog quirk on multi-column constraints (COLUMN_NAME NULL on header row). Inspect names instead.
+- `COUNT(*) AS SQLCUBE_AGG_<N>` in pushdown for a bare measure column — different adapter bug, `aggregate_translator.lua` substring-matching column names against "COUNT"/"SUM"/etc. Already fixed by guarding column-type exprs.
 
 ## When to skip / clean up
 

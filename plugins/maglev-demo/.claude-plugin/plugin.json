@@ -1,0 +1,7 @@
+{
+  "name": "maglev-demo",
+  "description": "Internal Maglev Tour skills — agent driver for the same 8-step demo the Maglev web Studio Tour wizard runs. Mirrors the GUI flow end-to-end via the Studio FastAPI backend. NOT part of the public exasol-skills marketplace — install manually with `claude plugin install <local-path>/plugins/maglev-demo`.",
+  "version": "0.1.0",
+  "internal": true,
+  "notes": "Brand lock: 'Maglev' is the product/CLI binary name; 'Tour' is the 8-step flow (no 'Factory' prefix); 'Cube' is the user-facing name for the semantic layer ('SQLCUBE_REGISTRY' and 'SQLCUBE.ADAPTER' are internal DB identifiers ONLY, never in user-facing surfaces). Public exasol-labs/exasol-agent-skills marketplace.json must NOT reference this plugin. Skills assume the live Studio FastAPI backend at http://localhost:8002 with the Snowflake → ACME_ADVENTUREWORKS data path documented in exasol-zemantic-layer/{FACTORY_TOUR_DEMO_PATH,MAGLEV_CLI_HANDOFF,MAGLEV_RCLS_DEEP_DIVE}.md."
+}

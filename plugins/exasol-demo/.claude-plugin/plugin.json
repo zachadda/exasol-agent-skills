@@ -1,7 +1,0 @@
-{
-  "name": "exasol-demo",
-  "description": "Internal demo orchestrator + RCLS + persona-switching skills. Mirrors the Factory Tour GUI flow end-to-end via agent. NOT part of the public exasol-skills marketplace — install manually with `claude plugin install <local-path>/plugins/exasol-demo`.",
-  "version": "0.1.0",
-  "internal": true,
-  "notes": "Public exasol-labs/exasol-agent-skills marketplace.json must NOT reference this plugin. Demo skills assume the live SQLCUBE Studio backend at http://localhost:8002 with the Snowflake → ACME_ADVENTUREWORKS → SQLCUBE_ACME_ADVENTUREWORKS data path described in exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md."
-}

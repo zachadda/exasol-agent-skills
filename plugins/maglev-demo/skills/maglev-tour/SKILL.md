@@ -1,10 +1,10 @@
 ---
-name: factory-tour
-description: Agent parody of the Factory Tour GUI demo. Walks a stakeholder through the 8-step end-to-end pipeline — Target → Source → Schema → Migrate → Optimize → Cube → Security → Query — via the same SQLCUBE Studio HTTP backend the GUI uses, narrating progress via TaskCreate/TaskUpdate instead of ActionLog widgets. Demo-only; not in the public exasol-skills marketplace. Source contract is documented in exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md.
+name: maglev-tour
+description: Agent parody of the Maglev Tour GUI demo. Walks a stakeholder through the 8-step end-to-end pipeline — Target → Source → Schema → Migrate → Optimize → Cube → Security → Query — via the same Maglev Studio HTTP backend the GUI uses, narrating progress via TaskCreate/TaskUpdate instead of ActionLog widgets. Demo-only; not in the public exasol-skills marketplace. Source contract is documented in exasol-zemantic-layer/exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md.
 
 preconditions:
   - studio_backend_reachable:
-      doc: "Studio FastAPI backend reachable. Default port for the Factory Tour demo is 8002 (per FACTORY_TOUR_DEMO_PATH.md). Auth via cookie obtained from POST /api/auth/login {password, persona='admin'}. STUDIO_AUTH_BYPASS=true accepts any password on dev machines."
+      doc: "Studio FastAPI backend reachable. Default port for the Maglev Tour demo is 8002 (per exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md). Auth via cookie obtained from POST /api/auth/login {password, persona='admin'}. STUDIO_AUTH_BYPASS=true accepts any password on dev machines."
       check: |
         # Bash:
         # curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8002/api/auth/me
@@ -17,7 +17,7 @@ preconditions:
         # exapump sql --profile demo-tour "SELECT 1"
       satisfied_by: exasol-nano-local
   - source_connection_seeded:
-      doc: "Exasol-side CONNECTION object pointing at the demo source. Default for Factory Tour: SNOWFLAKE_CONNECTION → qaasyds-bq49773.snowflakecomputing.com / ACME_DEMO / ADVENTUREWORKS. Operator-seeded one-time per FACTORY_TOUR_DEMO_PATH.md §Setup step 3."
+      doc: "Exasol-side CONNECTION object pointing at the demo source. Default for Maglev Tour: SNOWFLAKE_CONNECTION → qaasyds-bq49773.snowflakecomputing.com / ACME_DEMO / ADVENTUREWORKS. Operator-seeded one-time per exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md §Setup step 3."
       check: |
         # SQL:
         # SELECT 1 FROM SYS.EXA_ALL_CONNECTIONS WHERE CONNECTION_NAME='SNOWFLAKE_CONNECTION';
@@ -70,7 +70,7 @@ parameters:
         doc: "`auto_accept` runs phases continuously; `step_by_step` pauses after each one for user confirmation."
     - studio_base_url:
         default: "http://127.0.0.1:8002"
-        doc: "Studio FastAPI base URL. Demo default is 8002 (Factory Tour) — distinct from 8001 (other studio runs)."
+        doc: "Studio FastAPI base URL. Demo default is 8002 (Maglev Tour) — distinct from 8001 (other studio runs)."
 
 estimated_impact:
   full_run: "~3-5 minutes against pre-seeded demo-tour container with Snowflake CONNECTION already created. Real Snowflake → Exasol IMPORT (~15s on JDBC 3.20 + Arrow), two-pass optimize, cube generate + deploy, RCLS seed, four persona queries."
@@ -79,13 +79,13 @@ internal: true
 not_in_marketplace: true
 ---
 
-# /factory-tour — agent parody of the GUI Factory Tour
+# /maglev-tour — agent parody of the GUI Maglev Tour
 
-End-to-end demo orchestrator. Same backend endpoints the GUI hits (`studio/frontend/src/pages/FactoryTour.jsx`); the agent replaces ActionLog widgets with `TaskCreate` / `TaskUpdate` progress. Source of truth: `exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md`.
+End-to-end demo orchestrator. Same backend endpoints the GUI hits (`studio/frontend/src/pages/FactoryTour.jsx`); the agent replaces ActionLog widgets with `TaskCreate` / `TaskUpdate` progress. Source of truth: `exasol-zemantic-layer/exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md`.
 
 ## When to trigger
 
-- User invokes `/factory-tour` directly.
+- User invokes `/maglev-tour` directly.
 - User says "demo the factory tour", "show the boss the agent pipeline", "run the 8-step demo", "do the snowflake demo end to end".
 
 Do **not** trigger for narrower asks. `/oneshot-tour` is the simpler intro flow (no RCLS, no persona switch) and should still be used when the goal is just cube + dashboard.
@@ -96,7 +96,7 @@ Eight phases. Each phase hits a known studio HTTP endpoint, verifies the underly
 
 | # | Phase | Skill | Primary endpoint |
 |---|---|---|---|
-| 1 | Target | exasol-nano-local + studio | `POST /api/connection/profiles/:id/activate` |
+| 1 | Target | exasol-nano-local + studio | `POST /api/connections/profiles/:id/activate` |
 | 2 | Source | exasol-migrate | `POST /api/import/jdbc/test-connection` |
 | 3 | Schema | exasol-migrate | `GET /api/import/jdbc/databases` + `/jdbc/schemas` |
 | 4 | Migrate | exasol-migrate | `POST /api/import/snowflake/preview-migration` → fan-out `POST /api/import/snowflake/run-sql` |
@@ -107,7 +107,7 @@ Eight phases. Each phase hits a known studio HTTP endpoint, verifies the underly
 
 ## Routing algorithm
 
-Five phases (Factory Tour GUI matches this — sub-step grouping):
+Five phases (Maglev Tour GUI matches this — sub-step grouping):
 
 | Phase | Reference | What happens |
 |---|---|---|

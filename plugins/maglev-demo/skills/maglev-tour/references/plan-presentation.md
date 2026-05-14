@@ -6,7 +6,7 @@ Render the 8-step plan as a checklist before executing. Boss sees what's about t
 
 ```
 agent:
-  ### Factory Tour plan — 8 phases
+  ### Maglev Tour plan — 8 phases
 
   | # | Phase | Skill | What lands |
   |---|---|---|---|

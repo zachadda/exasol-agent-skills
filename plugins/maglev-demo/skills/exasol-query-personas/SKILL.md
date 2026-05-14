@@ -54,7 +54,7 @@ Run the same query under each of N personas, capture the divergent results, rend
 ## When to trigger
 
 - User asks "switch personas", "show me what each role sees", "demo the RCLS impersonation", "compare SYS vs RCLS_CANADA".
-- `/factory-tour` orchestrator at Phase 8.
+- `/maglev-tour` orchestrator at Phase 8.
 
 Do NOT trigger when there's only one persona to query — use plain `POST /api/query/execute` without `execution_user` instead.
 
