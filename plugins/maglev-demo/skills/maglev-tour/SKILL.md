@@ -73,7 +73,8 @@ parameters:
         doc: "Studio FastAPI base URL. Demo default is 8002 (Maglev Tour) — distinct from 8001 (other studio runs)."
 
 estimated_impact:
-  full_run: "~3-5 minutes against pre-seeded demo-tour container with Snowflake CONNECTION already created. Real Snowflake → Exasol IMPORT (~15s on JDBC 3.20 + Arrow), two-pass optimize, cube generate + deploy, RCLS seed, four persona queries."
+  full_cold_run: "~60-65 sec end-to-end against demo-tour with Snowflake CONNECTION + migration scripts + EXA_OPTIMIZE UDFs already seeded. Cold-start dress rehearsal 2026-05-14 = 62.22s wall time. Breakdown: Target 1.0s | Source 3.3s (OCSP warmup) | Schema 7.4s | Migrate 28.7s (84k rows, 9 tables, Arrow JDBC parallel) | Optimize 9.0s (two-pass) | Cube 11.3s | Security 1.4s | Persona showcase 0.1s. Boss-demo target of <60s missed by 2s — driven mostly by Snowflake first-call OCSP and JDBC databases/schemas listing."
+  warm_run: "~5 sec — warm-state probe detects cube + RCLS in place, skips Phases 1-7 verify-only, runs Phase 8 showcase directly."
 
 internal: true
 not_in_marketplace: true
