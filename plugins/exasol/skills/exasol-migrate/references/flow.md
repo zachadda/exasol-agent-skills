@@ -2,6 +2,26 @@
 
 The shared pipeline the skill follows against any source system in `studio/backend/fixtures/migration-scripts/`. Vendor-specific knobs are in `references/<vendor>.md`; read this first.
 
+## Two ways to drive the flow
+
+When the studio FastAPI backend is reachable, prefer its HTTP endpoints — they wrap the SQL with credential storage, driver placement, and progress polling already wired in:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET  /api/imports/driver-catalog` | List `DRIVER_PRESETS` (source_type → jar name / Java class / URL prefix) |
+| `POST /api/imports/jdbc/save-connection` | Persist credentials into the studio's local SQLite (Fernet-encrypted) under a profile name |
+| `POST /api/imports/jdbc/test-config` / `/test-connection` | Validate a profile or a freshly-saved connection without committing anything |
+| `POST /api/imports/jdbc/preview` | Generate the IMPORT SQL for review without running it |
+| `POST /api/imports/jdbc/run-import` | Execute the generated IMPORT batch and stream progress |
+| `GET  /api/imports/jdbc/databases` / `/schemas` | List remote databases / schemas through an existing CONNECTION (uses `IMPORT FROM JDBC STATEMENT '<vendor catalog query>'`) |
+| `POST /api/imports/snowflake/preview-migration` / `/run-sql` | Snowflake-specific flow that calls `EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL` with EXECUTION_MODE=DEBUG or EXECUTE |
+| `GET  /api/imports/migration-scripts` / `/installed` | Inspect available migration scripts + which are installed |
+| `POST /api/imports/migration-scripts/install` | Install or re-install a migration script from `fixtures/migration-scripts/` |
+| `POST /api/imports/cancel-running` | Interrupt a long-running import |
+| `POST /api/imports/artifacts/upload` | Upload BucketFS artifacts (driver jars, CSV/Parquet sources) used by the import |
+
+Fall back to direct SQL (below) when the FastAPI backend isn't reachable. The SQL is the same machinery the endpoints wrap — see the canonical-source list and the `CREATE CONNECTION` pattern that follows.
+
 Canonical source code:
 - IMPORT statement builder: `studio/backend/routers/imports.py:_build_import_sql()`
 - CONNECTION test: `_build_connection_test_sql()` (same file)
