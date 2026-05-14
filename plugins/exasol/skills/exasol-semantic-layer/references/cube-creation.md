@@ -1,6 +1,10 @@
-# Cube creation
+# Cube creation — direct SQL fallback
 
-The full deploy flow: write SQLCUBE_REGISTRY rows then create / refresh the virtual schema. Canonical reference implementation: `factory-foundation/studio/backend/services/sqlcube_builder.py` and `services/deployer.py:deploy()`.
+**This file is the fallback path.** The primary agent flow is `deploy-flow.md` — POST `/sqlcube/generate` → `/sqlcube/validate` → `/deploy/execute`, which runs the documented pipeline below for you (with LLM enrichment, validator, alias collision detection, and adapter-bundle redeploy). Use this file only when the studio backend is unreachable and you must drive the registry writes from raw SQL.
+
+Canonical reference implementation: `factory-foundation/studio/backend/services/sqlcube_builder.py` + `services/deployer.py:deploy()`. The hand-crafted SQL described here mirrors what `deploy()` runs — agents replicating it lose the validator, the LLM enrichment, the two-pass DELETE that purges stale `MODEL_ID` slugs, and the `_deploy_adapter_script()` upload step.
+
+The full deploy flow: write SQLCUBE_REGISTRY rows then create / refresh the virtual schema.
 
 ## CREATE VIRTUAL SCHEMA statement shape
 

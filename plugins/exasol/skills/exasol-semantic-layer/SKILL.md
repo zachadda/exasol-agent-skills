@@ -20,6 +20,20 @@ preconditions:
         # SELECT 1 FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA='SQLCUBE' AND SCRIPT_NAME='ADAPTER';
         # SELECT 1 FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA='<registry_schema>' AND TABLE_NAME='MODELS';
       satisfied_by: null   # one-time install; see references/install.md if missing
+  - exa_optimize_udfs_installed:
+      doc: "EXA_OPTIMIZE schema holds the 10 deploy-flow UDFs (ANALYZE_CONSTRAINTS, INFER_JOIN_PATHS, DRY_RUN_PLAN, etc.) the skill uses for constraint discovery and join-graph inference."
+      check: |
+        # SQL:
+        # SELECT COUNT(*) FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA='EXA_OPTIMIZE';
+        # Returns >= 5 when exasol-optimize has installed the bundle.
+      satisfied_by: exasol-optimize
+  - studio_backend_reachable:
+      doc: "Studio FastAPI backend reachable over HTTP (default http://localhost:8001). Enables the preferred /sqlcube/generate → /validate → /deploy/execute flow. When unreachable the skill degrades to direct UDF + hand-crafted SQL — see references/deploy-flow.md path B/C."
+      check: |
+        # Shell:
+        # curl -sf http://localhost:8001/api/health >/dev/null && echo OK
+        # OR: factory-foundation/scripts/agent_env_check.sh
+      satisfied_by: null   # operator-managed; degrade gracefully if absent
 
 provides:
   - cube_live:
@@ -88,37 +102,42 @@ What it is NOT:
 | Phase | Reference | When |
 |---|---|---|
 | Architecture overview | `references/architecture.md` | Read first; explains Models vs Domains, virtual-schema naming, adapter runtime |
-| Registry metadata model | `references/meta-model.md` | When writing rows into SQLCUBE_REGISTRY |
-| Cube creation | `references/cube-creation.md` | The CREATE VIRTUAL SCHEMA flow + DELETE/INSERT upsert by domain_id |
-| LLM enrichment | `references/llm-enrichment.md` | When `llm_enrichment=true` (default) |
+| **Deploy flow** | **`references/deploy-flow.md`** | **Primary** — studio backend endpoints + `EXA_OPTIMIZE` UDFs do every step. Default agent path. |
+| LLM enrichment | `references/llm-enrichment.md` | When `/sqlcube/generate llm_enrichment=true` won't suffice or you're filling proposals after the fact |
 | Query patterns | `references/query-patterns.md` | After cube is live — wide-denormalized SELECT shapes |
+| Registry metadata model | `references/meta-model.md` | Reference for the registry table shapes the deployer writes. Read when debugging, not when authoring SQL by hand. |
+| Cube creation (fallback) | `references/cube-creation.md` | **Fallback only** — pure hand-crafted SQL for clusters with no studio backend reachable. Don't default here. |
 | Install | `references/install.md` | When `sqlcube_installed` precondition fails |
 | Troubleshooting | `references/troubleshooting.md` | When CREATE VIRTUAL SCHEMA or query fails |
 
-## Pipeline
+## Pipeline (preferred — studio-driven; see `deploy-flow.md`)
 
 ```
-1. Verify preconditions             (schema_optimized AND sqlcube_installed)
-2. Read source schema + join graph  (SYS.EXA_ALL_TABLES, SYS.EXA_ALL_COLUMNS, SYS.EXA_ALL_CONSTRAINTS)
-3. Classify tables                  (suffix detection + FK direction → DIM vs FACT)
-4. Generate structural model        (one MODELS row per FACT; DIMENSIONS rows per dim column; JOINS by JOIN_ORDER)
-5. LLM enrichment (optional)        (Domain naming, measure proposals, attribute display names)
-6. Merge user overrides             (measures_overrides + dimensions_overrides YAMLs)
-7. Upsert registry rows             (DELETE by domain_id, then INSERT — see cube-creation.md)
-8. Build virtual schema SQL         (CREATE OR REPLACE VIRTUAL SCHEMA SQLCUBE_<LAYER>... )
-9. Verify cube_live                 (provides contract — 3-step SQL check)
-10. Hand back to caller
+1. Verify preconditions             (schema_optimized AND sqlcube_installed; EXA_OPTIMIZE UDFs present)
+2. Declare constraints              (EXA_OPTIMIZE.ANALYZE_CONSTRAINTS → /optimize/apply-review-proposal OR DRY_RUN_PLAN — owned by exasol-optimize skill)
+3. Infer join graph                 (EXECUTE SCRIPT EXA_OPTIMIZE.INFER_JOIN_PATHS)
+4. Parse source DDL                 (GET /api/sqlcube/introspect-sql?schema=<S>)
+5. Generate SqlcubeModel            (POST /api/sqlcube/generate llm_enrichment=true)
+6. (Optional) Run skill prompts     (prompts/cube-enrichment.md if /generate's deterministic draft needs richer LLM proposals)
+7. Validate                         (POST /api/sqlcube/validate)
+8. Pre-flight conflict check        (POST /api/deploy/check)
+9. Execute deploy                   (POST /api/deploy/execute → services.deployer.deploy() does registry + adapter + virtual schema)
+10. Verify cube_live                (provides contract — 3-step SQL check)
+11. Hand back to caller
 ```
+
+Steps 2–9 are HTTP / UDF calls. The agent never hand-writes `INSERT INTO SQLCUBE_REGISTRY.*` SQL in this path. Only fall back to the hand-crafted batch in `cube-creation.md` when the studio backend is unreachable.
 
 ## Step 0: Preconditions
 
-Two prerequisites:
+Four prerequisites:
 
-1. **Schema is optimized.** `exasol-optimize` must have run so `SYS.EXA_ALL_CONSTRAINTS` has PKs and FKs for the source schema. The skill builds JOINS rows from declared FKs; if none exist, no joins land and the cube has only fact-table measures.
-
+1. **Schema is optimized.** `exasol-optimize` must have run so `SYS.EXA_ALL_CONSTRAINTS` has PKs and FKs for the source schema. The studio `/sqlcube/generate` endpoint reads these to build join paths; `EXECUTE SCRIPT EXA_OPTIMIZE.INFER_JOIN_PATHS('<S>')` falls back to name-stem matching when declared FKs are missing.
 2. **SQLCUBE infrastructure installed.** Three things: `SQLCUBE` schema with `ADAPTER` UDF, the registry schema (default `SQLCUBE_REGISTRY`) with all required tables, and the adapter Lua bundle uploaded to `/buckets/bfsdefault/default/sqlcube_adapter.lua` (or equivalent). `exanano-sqlcube` ships this pre-installed. For others see `references/install.md`.
+3. **`EXA_OPTIMIZE` UDFs installed.** The 10-script bundle (`ANALYZE_CONSTRAINTS`, `INFER_JOIN_PATHS`, `DRY_RUN_PLAN`, etc.) — installed by the `exasol-optimize` skill or directly via `studio/backend/services/scripts_library.py:install_optimize_scripts()`. Without these the constraint-discovery + join-inference steps in `deploy-flow.md` have no surface to call.
+4. **Studio backend reachable (preferred).** Enables `/sqlcube/generate` + `/sqlcube/validate` + `/deploy/execute` — the primary deploy flow. When the backend isn't reachable, fall back to `deploy-flow.md` path B (UDF-only) or C (pure hand-crafted SQL).
 
-If either fails → route to the satisfying skill before proceeding.
+If any of #1–#3 fails → route to the satisfying skill before proceeding. If #4 fails → degrade to fallback path; do not break.
 
 ## Conventions
 

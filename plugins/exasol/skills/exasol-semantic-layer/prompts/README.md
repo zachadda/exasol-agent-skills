@@ -1,12 +1,16 @@
 # Semantic-layer LLM prompts
 
-Prompt templates for the `llm_enrichment` phase of `exasol-semantic-layer`. The
-skill produces a structurally complete cube without LLM (suffix detection + FK
-graph). The prompts add the business-facing layer: descriptions, measure
-formulas, named relationships, column display names.
+Prompt templates for the agent-side enrichment loop. **Equivalent to the GUI "offline pack" workflow** in `factory-foundation/studio/frontend/src/lib/offlinePacks.js` — where a human downloads a ZIP, hands the bundled `prompt.md` + `cube_context.json` to Claude/GPT externally, then uploads the returned `sqlcube_metric_proposals.md` / `sqlcube_optimization_review.md` back to Studio. The agent loop collapses both halves: agent IS the LLM, so the round trip disappears.
 
-See `references/llm-enrichment.md` for the overall enrichment pipeline. This
-directory holds the concrete prompt text.
+Use these when:
+
+1. Calling `POST /sqlcube/generate llm_enrichment=true` isn't enough — typically because you want richer measure proposals or a domain-specific narration on top of the deterministic draft.
+2. The studio backend isn't reachable but you still want enrichment locally.
+3. You're explicitly running the offline-pack agent loop (skill prompt = pack prompt content, agent IS the LLM, agent merges results back via `/sqlcube/validate` + `/deploy/execute`).
+
+The studio backend has its own LLM path (`services/claude.py`); these skill prompts are what the agent runs when driving the loop itself.
+
+See `references/deploy-flow.md` (primary flow) and `references/llm-enrichment.md` (merge mechanics) for where the prompt output lands in the pipeline.
 
 ## Prompts in this directory
 

@@ -1,6 +1,12 @@
 # LLM enrichment
 
-Runs when `llm_enrichment=true` (default). Generates business descriptions, measure proposals, attribute display names. Without this step the cube is structurally sound but cosmetically sparse — analysts see raw physical column names.
+Generates business descriptions, measure proposals, attribute display names. Without this step the cube is structurally sound but cosmetically sparse — analysts see raw physical column names.
+
+**Three ways to get LLM enrichment**, in order of preference:
+
+1. `POST /sqlcube/generate { llm_enrichment: true }` — studio backend handles the prompt via `services/claude.py` and returns an enriched `SqlcubeModel` ready for `/deploy/execute`. Default path. See `deploy-flow.md` step 5.
+2. Agent-side loop using the prompts in `../prompts/` — when you want to drive enrichment yourself (e.g. richer measure proposals than the studio default, custom domain framing). Output JSON merges into the model before `/sqlcube/validate`.
+3. Offline pack — GUI users download a ZIP, hand it to an external LLM, upload the returned `.md`. Same shape as #2 but with a human in the loop. Agents skip this.
 
 Target schema: `SQLCUBE_REGISTRY` (configurable via `registry_schema` parameter).
 
