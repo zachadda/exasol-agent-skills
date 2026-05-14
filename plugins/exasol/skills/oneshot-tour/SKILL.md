@@ -97,6 +97,23 @@ On halt, the agent must:
 - Suggest the next manual action (re-run, switch to step_by_step, inspect logs, etc.).
 - Not retry automatically. The user picks the next move.
 
+## Re-running against an already-loaded source
+
+`/oneshot-tour` is partially idempotent. What's safe and what isn't:
+
+| Step | Re-run behavior | Source of truth |
+|---|---|---|
+| 1. Nano boot | Safe. `docker start <name>` no-ops on a running container. | `exasol-nano-local` |
+| 2. Connect to source | Safe. `exasol-migrate` creates a CONNECTION with a per-run name (default `<SOURCE_TYPE_UPPER>_MIGRATE_<TIMESTAMP>`) and DROPs it after the migration. The connection object never outlives the step, so there is nothing to collide with on re-run. | `studio/backend/routers/imports.py` |
+| 3. Import schema | **Partly destructive.** Migration scripts in `EXA_DB_MIGRATION.<VENDOR>_TO_EXASOL` typically `DROP TABLE IF EXISTS` per target before re-creating. Existing rows in the target schema are lost. Pass `EXECUTION_MODE='DEBUG'` first to inspect generated SQL if uncertain. | `studio/backend/fixtures/migration-scripts/*.sql` |
+| 4. Optimize | Safe. `ALTER TABLE ADD PRIMARY KEY ...` errors with `already exists` are caught and treated as success by `DRY_RUN_PLAN`. | `EXA_OPTIMIZE.DRY_RUN_PLAN` |
+| 5. Create cube | Registry-safe, virtual-schema-conflict. `sqlcube_builder.build_registry_sql()` does DELETE-then-INSERT per `DOMAIN_ID` in FK-correct order, so `SQLCUBE_REGISTRY.*` rows are upserted cleanly. **But** `CREATE VIRTUAL SCHEMA` will fail with `object already exists` if the target name is reused. Either `DROP VIRTUAL SCHEMA <name>` first or pick a new `target_cube_name`. | `studio/backend/services/sqlcube_builder.py` + `services/deployer.py` |
+| 6. Dashboard | Safe. New ephemeral HTML file per run; previous server can be killed first if port collides (see `references/dashboard-handoff.md` port-fallback note). | `exasol-dashboard` |
+
+The orchestrator should detect step-5 collision pre-flight: if `SYS.EXA_VIRTUAL_SCHEMAS` already contains `:target_cube_name`, prompt the user to either drop it or rename before continuing. Do not silently drop.
+
+A clean re-run against the same source typically only needs steps 3 + 5 redone; the orchestrator's precondition DAG should already detect that nano is running, the source connection isn't persistent, and PKs from a prior optimize remain in place.
+
 ## What ships at "done"
 
 When `/oneshot-tour` completes successfully:
