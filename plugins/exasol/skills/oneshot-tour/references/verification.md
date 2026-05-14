@@ -60,9 +60,15 @@ LIMIT 1;
 
 -- 5. Compose + run sample query.
 --    Both `MODEL_ID` and `VIRTUAL_COL` are case-preserving — quote them.
---    Quote the result aliases too: `value` is a reserved keyword in Exasol
---    (ISO SQL), so `AS value` parses as a syntax error. Use `AS "value"` or a
---    non-reserved alias like `AS "amount"` / `AS "bucket"`.
+--    Quote the result aliases too. Exasol enforces ISO SQL reserved keywords
+--    strictly; these all parse as syntax errors when used unquoted as aliases:
+--      value, month, year, day, hour, minute, second, quarter, week,
+--      date, time, timestamp, level, position, role, size, type.
+--    Use either a quoted form (`AS "month"`) or a non-reserved alias
+--    (`AS month_name`, `AS amount`, `AS bucket`). Quoted is safer for
+--    LLM-generated SQL — agents tend to pick natural-language column
+--    aliases that overlap with the reserved list.
+--    Authoritative list: SYS.EXA_SQL_KEYWORDS.
 SELECT
   "<dim_virtual_col>"                   AS "bucket",
   <agg_type>("<measure_virtual_col>")   AS "amount"
@@ -148,7 +154,7 @@ tour_state:
 | `SQLCUBE_REGISTRY.MODELS` empty for FACT_SCHEMA | "Virtual schema is live but no MODEL was registered. Semantic-layer skill misbehaved." |
 | `SQLCUBE_REGISTRY.MEASURES` has rows but none with `IS_VISIBLE = TRUE` | "Model `<id>` has measures registered but all are hidden. Re-run step 5 with `llm_enrichment: true`, or update IS_VISIBLE on at least one measure." |
 | `SQLCUBE_REGISTRY.DIMENSIONS` has rows but none with `IS_VISIBLE = TRUE` | Same as above for dims. Pick `COUNT(*)` as the measure and report "no visible dims; verified at fact-row-count level only". |
-| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script). Common cause: unquoted reserved-keyword alias (e.g. `AS value` instead of `AS "value"`). |
+| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script). Common cause: unquoted reserved-keyword alias — Exasol reserves `value, month, year, day, hour, minute, second, quarter, week, date, time, timestamp, level, position, role, size, type` (non-exhaustive — see `SYS.EXA_SQL_KEYWORDS`). Quote the alias or rename it. |
 | Sample query returns 0 rows | "Cube is live but query returned no rows. Possible model error: dim/measure don't connect to facts. Inspect `SQLCUBE_REGISTRY.JOINS` for the model." |
 
 On halt, Phase 5 does NOT run. Tour ends without a dashboard.
