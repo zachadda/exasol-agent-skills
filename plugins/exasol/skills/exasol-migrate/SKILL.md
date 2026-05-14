@@ -1,6 +1,6 @@
 ---
 name: exasol-migrate
-description: Migrate a schema from an external RDBMS into Exasol using the studio backend's IMPORT FROM JDBC machinery. Creates a Exasol-side CONNECTION object, runs per-table IMPORTs via the existing migration scripts in EXA_DB_MIGRATION, and tracks results in JOB_LOG / JOB_DETAILS. Supports 16+ source systems via the studio's driver presets and migration scripts.
+description: Migrate a schema from an external RDBMS into Exasol using the studio backend's IMPORT FROM JDBC machinery. Creates an Exasol-side CONNECTION object, runs per-table IMPORTs via the existing migration scripts in EXA_DB_MIGRATION, and tracks results in JOB_LOG / JOB_DETAILS (Snowflake script only; other vendors don't auto-log). 17 vendor migration scripts shipped in studio/backend/fixtures/migration-scripts/ (azure_sql, bigquery, db2, exasol, mariadb, mysql, netezza, oracle, postgres, redshift, s3, sap_hana, snowflake, sqlserver, teradata, vectorwise, vertica) plus 3 utility scripts (query_wrapper, delta_import_on_primary_keys, restore_stage_to_target). **Per-vendor signatures are not normalized** — separate ongoing studio-team project. Treat `snowflake_to_exasol` as the canonical example; check `references/flow.md` "Per-vendor signatures vary" + the live script source before invoking another vendor.
 
 preconditions:
   - jdbc_driver_present:
@@ -60,7 +60,7 @@ parameters:
         doc: "Source credentials. Skill prefers reading from studio's CONNECTION_PROFILES SQLite store; direct params override. Plaintext password is passed to the CREATE CONNECTION statement which Exasol stores encrypted. Never logged."
     - execute_mode:
         default: EXECUTE
-        doc: "DEBUG (print generated SQL only, do not run) | EXECUTE (run + log to JOB_LOG/JOB_DETAILS) | EXECUTE_NOLOG (run without log tables). Matches the migration script's mode parameter."
+        doc: "DEBUG (print generated SQL only, do not run) | EXECUTE (run + log to JOB_LOG/JOB_DETAILS) | EXECUTE_NOLOG (run without log tables). **Only `snowflake_to_exasol` and `restore_stage_to_target` expose this parameter** — the other 17 vendor scripts have no EXECUTION_MODE and run unconditionally on EXECUTE SCRIPT. Live-verified 2026-05-14. For non-Snowflake vendors, use `POST /api/import/jdbc/preview` for a pure dry-run instead — it returns the CREATE CONNECTION + IMPORT SQL without executing."
     - sample_only:
         default: false
         doc: "If true, append `WHERE ROWNUM <= 10000` (or vendor equivalent) to each STATEMENT. Used for fast structural verification."
@@ -157,7 +157,9 @@ The migration script handles per-table enumeration, type mapping, IMPORT generat
 ## Conventions
 
 - **Connection objects are ephemeral.** Skill creates one CONNECTION per migration run, named `<SOURCE_TYPE_UPPER>_MIGRATE_<TIMESTAMP>`, DROPs it on completion. Don't reuse long-lived connections — Exasol stores them encrypted but the credential refresh story is awkward.
-- **EXECUTE mode is default.** DEBUG mode is for inspection — prints the IMPORT SQL the script would have run. EXECUTE_NOLOG skips JOB_LOG/JOB_DETAILS tables (saves a few KB; loses audit).
+- **EXECUTE mode is default — but only on Snowflake / restore_stage_to_target.** Those two scripts expose `EXECUTION_MODE` as a parameter. DEBUG returns the per-table SQL as a result set instead of running it. **The other 17 vendor scripts have no EXECUTION_MODE** — they run unconditionally on `EXECUTE SCRIPT`. For dry-running a non-Snowflake migration: drive `POST /api/import/jdbc/preview` instead (returns the masked CREATE CONNECTION + IMPORT SQL with no execution).
+- **DEBUG is not a pure dry-run even on Snowflake.** Live-verified 2026-05-14: `EXECUTION_MODE='DEBUG'` still queries the source catalog to enumerate databases / schemas / tables. Without a working source CONNECTION the script errors with `Error on getting db list from Snowflake:` before reaching the result-set generation. To dry-run an offline migration: use the `/jdbc/preview` endpoint (pure, no source roundtrip) instead.
+- EXECUTE_NOLOG skips JOB_LOG/JOB_DETAILS tables (saves a few KB; loses audit). Snowflake-only.
 - **Connection name is identifier-quoted.** `_ident()` in `routers/imports.py` shows the studio's quoting convention. Names with mixed case must round-trip through `"name"` quoting consistently.
 - **Source statement is fully under user control via the migration script.** Studio's migration scripts have well-defined parameters; this skill respects them rather than emitting bespoke SQL.
 

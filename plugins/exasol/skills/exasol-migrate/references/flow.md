@@ -8,17 +8,17 @@ When the studio FastAPI backend is reachable, prefer its HTTP endpoints — they
 
 | Endpoint | Purpose |
 |---|---|
-| `GET  /api/imports/driver-catalog` | List `DRIVER_PRESETS` (source_type → jar name / Java class / URL prefix) |
-| `POST /api/imports/jdbc/save-connection` | Persist credentials into the studio's local SQLite (Fernet-encrypted) under a profile name |
-| `POST /api/imports/jdbc/test-config` / `/test-connection` | Validate a profile or a freshly-saved connection without committing anything |
-| `POST /api/imports/jdbc/preview` | Generate the IMPORT SQL for review without running it |
-| `POST /api/imports/jdbc/run-import` | Execute the generated IMPORT batch and stream progress |
-| `GET  /api/imports/jdbc/databases` / `/schemas` | List remote databases / schemas through an existing CONNECTION (uses `IMPORT FROM JDBC STATEMENT '<vendor catalog query>'`) |
-| `POST /api/imports/snowflake/preview-migration` / `/run-sql` | Snowflake-specific flow that calls `EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL` with EXECUTION_MODE=DEBUG or EXECUTE |
-| `GET  /api/imports/migration-scripts` / `/installed` | Inspect available migration scripts + which are installed |
-| `POST /api/imports/migration-scripts/install` | Install or re-install a migration script from `fixtures/migration-scripts/` |
-| `POST /api/imports/cancel-running` | Interrupt a long-running import |
-| `POST /api/imports/artifacts/upload` | Upload BucketFS artifacts (driver jars, CSV/Parquet sources) used by the import |
+| `GET  /api/import/driver-catalog` | List `DRIVER_PRESETS` (source_type → jar name / Java class / URL prefix) |
+| `POST /api/import/jdbc/save-connection` | Persist credentials into the studio's local SQLite (Fernet-encrypted) under a profile name |
+| `POST /api/import/jdbc/test-config` / `/test-connection` | Validate a profile or a freshly-saved connection without committing anything |
+| `POST /api/import/jdbc/preview` | Generate the IMPORT SQL for review without running it. **Pure dry-run** — does NOT hit the source. Returns `{connection_sql_masked, import_sql, connection_name, jdbc_url}`. Use this when you want a no-side-effects preview on any vendor (including non-Snowflake where the script itself has no DEBUG mode). |
+| `POST /api/import/jdbc/run-import` | Execute the generated IMPORT batch and stream progress |
+| `GET  /api/import/jdbc/databases` / `/schemas` | List remote databases / schemas through an existing CONNECTION (uses `IMPORT FROM JDBC STATEMENT '<vendor catalog query>'`) |
+| `POST /api/import/snowflake/preview-migration` / `/run-sql` | Snowflake-specific flow that calls `EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL` with EXECUTION_MODE=DEBUG or EXECUTE |
+| `GET  /api/import/migration-scripts` / `/installed` | Inspect available migration scripts + which are installed |
+| `POST /api/import/migration-scripts/install` | Install or re-install a migration script from `fixtures/migration-scripts/`. Body field is `filenames` (array), not `filename` (singular) — e.g. `{"filenames":["snowflake_to_exasol.sql"]}`. Returns `{success, message, installed:[...], errors:[...]}`. |
+| `POST /api/import/cancel-running` | Interrupt a long-running import |
+| `POST /api/import/artifacts/upload` | Upload BucketFS artifacts (driver jars, CSV/Parquet sources) used by the import |
 
 Fall back to direct SQL (below) when the FastAPI backend isn't reachable. The SQL is the same machinery the endpoints wrap — see the canonical-source list and the `CREATE CONNECTION` pattern that follows.
 
@@ -261,22 +261,46 @@ Per-vendor specifics in `references/<vendor>.md` and within the script's Lua bod
 
 For a 1-node `exanano-sqlcube` Docker (typical dev): AUTO gives 6-12 parallel depending on host. For large source tables, parallelism helps; for many-small-table schemas, the per-table fixed cost dominates and AUTO ≈ serial.
 
-## DEBUG mode for inspection
+## DEBUG mode for inspection (Snowflake only)
 
-`EXECUTION_MODE='DEBUG'` returns the generated SQL as a result set instead of executing. The studio's UI exposes this for review-before-execute workflows.
+`EXECUTION_MODE='DEBUG'` returns the generated SQL as a result set instead of executing. **The studio's UI exposes this for review-before-execute workflows on Snowflake — only Snowflake.** The other 17 vendor scripts have no EXECUTION_MODE parameter (see "Per-vendor signatures vary" below) and run unconditionally on `EXECUTE SCRIPT`. To dry-run a non-Snowflake migration, drive `POST /api/import/jdbc/preview` instead — it returns the CREATE CONNECTION + IMPORT SQL without executing and with no source-side roundtrip.
 
 ```sql
 EXECUTE SCRIPT EXA_DB_MIGRATION.SNOWFLAKE_TO_EXASOL(
     'SNOWFLAKE_MIGRATE_20260513',
     FALSE, 'ACME_DEMO', 'ADVENTUREWORKS', 'ADVENTUREWORKS', '%',
     TRUE,
-    'DEBUG',                          -- ← inspect mode
+    'DEBUG',                          -- ← inspect mode (Snowflake only)
     NULL,
     NULL
 );
 ```
 
 Returns N rows where each row is `(SQL_TEXT, SUCCESS, ERROR_MESSAGE)` for a single CREATE SCHEMA / CREATE TABLE / IMPORT INTO statement. Read, review, run manually OR re-invoke with `EXECUTION_MODE='EXECUTE'`.
+
+**DEBUG is not a pure dry-run even on Snowflake.** Live-verified 2026-05-14 against `exanano-sqlcube`: the script still queries the source catalog to enumerate databases / schemas / tables before generating the result set. With a fake `CONNECTION` the script aborts with `Error on getting db list from Snowflake:` before reaching the DEBUG output. For a real no-side-effects dry-run on any vendor, use `POST /api/import/jdbc/preview`.
+
+## Per-vendor signatures vary
+
+The migration-scripts library is **not normalized** — separate ongoing studio-team project. Each vendor script has its own argument list. Snowflake is the canonical, fullest-featured example (10 args including EXECUTION_MODE + LOGGING_SCHEMA). Others differ substantially.
+
+Live-checked 2026-05-14:
+
+| Script | Has `EXECUTION_MODE` | Has `LOGGING_SCHEMA` (auto-creates JOB_LOG / JOB_DETAILS) |
+|---|---|---|
+| `snowflake_to_exasol.sql` | ✓ | ✓ |
+| `restore_stage_to_target.sql` | ✓ | — (utility, not a vendor script) |
+| All 17 other vendor scripts (azure_sql, bigquery, db2, exasol, mariadb, mysql, netezza, oracle, postgres, redshift, s3, sap_hana, sqlserver, teradata, vectorwise, vertica) | ✗ | ✗ |
+
+Example signature divergence — `exasol_to_exasol.sql` takes 8 args (`CONNECTION_NAME, CONNECTION_SETTING, IDENTIFIER_CASE_INSENSITIVE, SCHEMA_FILTER, TABLE_FILTER, GENERATE_VIEWS, VIEW_FILTER, PK_SETTING`) — no execution-mode, no logging-schema, no target-schema, no db-filter, no parallel-connections. Completely different shape.
+
+Agent rule of thumb when adding a new vendor:
+
+1. List installed scripts: `GET /api/import/migration-scripts/installed`.
+2. If vendor's script isn't installed: `POST /api/import/migration-scripts/install {"filenames":["<vendor>_to_exasol.sql"]}` — note `filenames` is a list.
+3. Read the script source from `studio/backend/fixtures/migration-scripts/<vendor>_to_exasol.sql`. Grep for `^create or replace script ... \(` to extract the canonical argument list — the comments above each arg explain the contract.
+4. For Snowflake only, use the typed `/snowflake/preview-migration` endpoint. For everything else, compose the EXECUTE SCRIPT call by hand based on the script signature, or use `/jdbc/preview` for the per-table IMPORT shape.
+5. JOB_LOG / JOB_DETAILS auto-creation is Snowflake-only. Other vendors' results don't land in `EXA_DB_MIGRATION.JOB_LOG` — verify by row count, by table count in target schema, or by inspecting the script's own pquery-result handling.
 
 ## Error handling
 
