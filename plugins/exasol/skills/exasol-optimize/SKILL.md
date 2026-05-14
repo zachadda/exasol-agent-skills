@@ -10,7 +10,7 @@ preconditions:
         SELECT COUNT(*) AS N FROM SYS.EXA_ALL_TABLES
         WHERE UPPER("TABLE_SCHEMA") = UPPER(:source_schema)
           AND "TABLE_IS_VIRTUAL" = FALSE
-      satisfied_by: exasol-migrate-snowflake
+      satisfied_by: exasol-migrate
   - udf_installed:
       doc: "EXA_OPTIMIZE.ANALYZE_CONSTRAINTS script is registered"
       check: |
