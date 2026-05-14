@@ -193,7 +193,9 @@ Row mask + column mask both fire per persona — demo punchline doubled. Sales s
 
 Extension pattern: append any business-name string to `hidden_attributes` to mask additional measures. Adapter handles measure / derived_measure render-time wrapping automatically. Dim-level masking still requires the open extension noted below.
 
-Open extension: dimension-level user masking. `apply_attribute_user_security` already stamps `user_mask_predicate` onto matching `dim_meta`, but `main.lua` dim SELECT-render doesn't wrap yet. Add the same `CASE WHEN` wrap there for a complete story. Demo's hidden attribute is `"Gross Margin Pct"` (a measure), so this didn't block the demo.
+Dim-level user masking landed in `commit 06f2df9` on `demo-streamlined`. `main.lua` now uses a shared `build_dim_physical_expr` helper that wraps `alias.PHYSICAL_COL` with the same `CASE WHEN <user_mask_predicate> THEN NULL ELSE ...` shape in **both** SELECT and GROUP BY paths. Masked persona's rows collapse to a single NULL group (not N nulled rows with distinct underlying aggregates). Live-verified by inserting a test row `(SUBJECT_NAME='RCLS_CANADA', VIRTUAL_COL='Sales Territory Region')` — SYS saw 10 regions, RCLS_CANADA saw 1 row with `region=NULL` and `sales=$1.98M`. Test policy cleaned up post-verify; demo's permanent state still 4 row + 4 attribute policies.
+
+**Extension surface**: appending any business name (measure OR dim) to `hidden_attributes` for a persona now masks that column at query time. No adapter rebuild needed for new business-name targets — only `service/runtime_registry.py` + re-seed + REFRESH.
 
 ## Symptom → cause cheat sheet
 
