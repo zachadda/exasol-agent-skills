@@ -74,6 +74,18 @@ What this skill is NOT:
 - Not interactive (filters, slicers, drilldowns). Static charts only in v0.1.
 - Not authenticated. Anyone on localhost can read the dashboard. No production posture.
 - Not a replacement for Looker / Superset / Metabase. Use those when you need governance, sharing, scheduling.
+- **Not** the studio backend's `QuickChart` component. That's a Recharts-based React widget for ad-hoc charting against a single query result in the Workbench (see `studio/frontend/src/components/QuickChart.jsx`). This skill is a sibling, not a replacement — different stack (Vega-Lite vs Recharts), different surface (standalone HTML vs in-Workbench tab), different use case (preset multi-panel dashboards vs single-query exploration).
+
+## Query source: raw schema or cube
+
+The skill works against either source:
+
+| Source | When to use | Trade-off |
+|---|---|---|
+| **Raw physical schema** | Cube doesn't exist yet OR you need a column the cube doesn't expose | More verbose SQL (manual joins, aggregations); always works |
+| **SQLCube virtual schema** (`SQLCUBE_<LAYER_ID>`) | Cube exists and covers the panels you need | Less SQL (adapter handles joins + measures); cube's IS_VISIBLE filter may hide columns |
+
+For a fresh ADVENTUREWORKS environment via `/oneshot-tour`: the migrate + optimize + semantic-layer skills run first, so the cube is live and this skill prefers the cube. Set `source_name` to either the cube schema (`SQLCUBE_ADVENTUREWORKS`) or the physical schema (`ADVENTUREWORKS`) — skill detects which via `SYS.EXA_VIRTUAL_SCHEMAS`.
 
 ## Routing algorithm
 
