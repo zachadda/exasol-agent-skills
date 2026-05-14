@@ -160,6 +160,33 @@ Even with FKs and grants right, the adapter's `adapterNotes` cache survives sess
 
 **Fix**: `ALTER VIRTUAL SCHEMA "<vs>" REFRESH` at end of `seed_demo_policies`. Drops cache; next pushdown rebuilds from the registry.
 
+## Per-user column masking (fixed 2026-05-14 — commit `ca05f1b` on `demo-streamlined`)
+
+Earlier the column-mask path was broken on two layers:
+
+1. `DEMO_RCLS_SCENARIOS["hidden_attributes"] = ["GROSS_MARGIN"]` (slug). Cube exposed `"Gross Margin Pct"` (business name from metric pack). Adapter resolved `RCLS_ATTRIBUTE_POLICIES.VIRTUAL_COL` against business names → no match → policy was a no-op.
+2. `apply_static_attribute_security` in `metadata_registry.lua` only enforced policies with `SUBJECT_NAME = '*'` (wildcard). Per-user DENY rows (`RCLS_CANADA`, `RCLS_EUROPE`) were loaded into `model_meta.attribute_policies` but **never applied** — there was no runtime-user mask code path.
+
+Fix bundle (commit `ca05f1b`):
+
+- `services/runtime_registry.py`: scenarios now declare business names: `"hidden_attributes": ["Gross Margin Pct"]`.
+- `sqlcube/adapter/metadata_registry.lua`: new `apply_attribute_user_security` walks per-user DENY policies and stamps a `user_mask_predicate` SQL fragment (`UPPER(CURRENT_USER) IN ('RCLS_CANADA','RCLS_EUROPE')`) onto each matching measure / derived / dim. Called from `apply_runtime_security` alongside `apply_row_security`.
+- `sqlcube/adapter/measure_builder.lua`: `build_select_expr` + `build_derived_select_expr` now wrap with `CASE WHEN <predicate> THEN NULL ELSE <expr> END` AFTER ROUND/CAST when `user_mask_predicate` is set. Masked output is NULL, not zero or a wrong-typed default.
+- Adapter rebuilt via `sqlcube/adapter/build_adapter.py` and redeployed via `CREATE OR REPLACE LUA ADAPTER SCRIPT SQLCUBE.ADAPTER`. `ALTER VIRTUAL SCHEMA "SQLCUBE_<X>" REFRESH` after redeploy.
+
+Live-verified vs `exanano-demo-tour`:
+
+| Persona | Rows | Top country | GM% |
+|---|---|---|---|
+| SYS | 6 | US | 0.4154 |
+| RCLS_CANADA | 1 | Canada | **None (masked)** |
+| RCLS_EUROPE | 3 | UK | **None (masked)** |
+| RCLS_EXEC | 6 | US | 0.4154 |
+
+Row mask + column mask both fire per persona — demo punchline doubled.
+
+Open extension: dimension-level user masking. `apply_attribute_user_security` already stamps `user_mask_predicate` onto matching `dim_meta`, but `main.lua` dim SELECT-render doesn't wrap yet. Add the same `CASE WHEN` wrap there for a complete story. Demo's hidden attribute is `"Gross Margin Pct"` (a measure), so this didn't block the demo.
+
 ## Symptom → cause cheat sheet
 
 | Symptom | Likely cause | Confirm |
