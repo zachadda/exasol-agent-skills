@@ -76,18 +76,11 @@ After receiving response:
 3. **Description length.** > 200 chars → truncate at first sentence boundary.
 4. **No DDL leakage.** Reject if `suggested_name` or `description` contains SQL keywords (`ALTER`, `INSERT`, `SELECT`). LLM occasionally tries to "help" with DDL.
 
-## Storage
+## Output handling
 
-Surviving rows go into `EXA_OPTIMIZE_LOG.ENRICHMENT_NOTES`:
-
-```sql
-INSERT INTO EXA_OPTIMIZE_LOG.ENRICHMENT_NOTES
-  (SOURCE_SCHEMA, TABLE_NAME, COLUMN_NAME, NOTE_TYPE, SUGGESTED_NAME, DESCRIPTION, CONFIDENCE)
-VALUES
-  (?, ?, ?, 'column_name_hint', ?, ?, ?);
-```
-
-The skill's plan-presentation phase reads this and renders alongside DDL changes:
+Surviving hints are passed back to the skill's plan-presentation phase as
+JSON (in-memory, not persisted). The phase renders each hint alongside the
+DDL it relates to:
 
 ```
 ALTER TABLE FACT_SALES MODIFY COLUMN AMT DECIMAL(18,2);
@@ -95,7 +88,13 @@ ALTER TABLE FACT_SALES MODIFY COLUMN AMT DECIMAL(18,2);
   description: Likely the monetary value of the sale line.
 ```
 
-User decides whether to act on the hint (renames are out-of-skill — optimize doesn't rename columns in v0.1).
+User decides whether to act on the hint (renames are out-of-skill — optimize
+doesn't rename columns in v0.1).
+
+No Exasol-side persistence in v0.1. If a future iteration adds cross-session
+memory, the appropriate home is a new table in `SQLCUBE_META` (where studio
+backend already stores app-state and lineage metadata via `bootstrap.sql`),
+not a separately-managed schema.
 
 ## Cost
 

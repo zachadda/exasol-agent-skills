@@ -10,13 +10,18 @@ The optimize pipeline is **deterministic** for PK / FK discovery, type
 narrowing, and DDL emission. The LLM never decides what to ALTER. It only
 **annotates** the analysis with hints a human reviewer would find useful.
 
-Hints land in:
+Hints are returned inline as JSON to the skill caller. The skill renders
+them alongside the DRY_RUN_PLAN output so the user sees both the structural
+change AND the LLM's read on what it means.
 
-- `EXA_OPTIMIZE_LOG.ENRICHMENT_NOTES` — text annotations per (table, column)
-- `EXA_OPTIMIZE_LOG.HIERARCHY_FLAGS` — boolean + reason per self-FK candidate
-
-The skill renders these alongside the DRY_RUN_PLAN output so the user sees
-both the structural change AND the LLM's read on what it means.
+No persistence layer in v0.1. Hint outputs live for the duration of the
+plan-presentation phase and are not stored back to Exasol. If a downstream
+skill (semantic-layer enrichment, dashboard panel-planning) needs the same
+LLM-derived metadata, the orchestrator re-invokes the prompt or passes the
+JSON through. Cross-session persistence would need its own design (likely a
+new table in `SQLCUBE_META` rather than a separately-managed schema, since
+that's the existing app-metadata home — see studio backend's
+`bootstrap.sql`).
 
 ## Prompts in this directory
 

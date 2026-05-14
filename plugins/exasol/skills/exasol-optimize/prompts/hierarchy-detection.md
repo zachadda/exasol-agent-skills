@@ -89,16 +89,20 @@ For each surviving classification:
 
 The "auto-promote on high" path is the only LLM influence on the final DDL plan. Even there, the user sees the change in DRY_RUN_PLAN output before commit — no silent action.
 
-## Storage
+## Output handling
 
-```sql
-INSERT INTO EXA_OPTIMIZE_LOG.HIERARCHY_FLAGS
-  (SOURCE_SCHEMA, TABLE_NAME, FK_COLUMN, PK_COLUMN, HIERARCHY_KIND, CONFIDENCE, REASONING, AUTO_PROMOTED)
-VALUES
-  (?, ?, ?, ?, ?, ?, ?, ?);
-```
+Classifications are returned inline as JSON to the skill — no Exasol-side
+persistence in v0.1.
 
-`AUTO_PROMOTED=TRUE` when the skill upgraded REJECTED → ADD_FK based on this classification. Audit trail for "why is this FK there?"
+The skill keeps an in-memory map `{(table, fk_column, pk_column) →
+classification}` for the duration of the plan-presentation phase. When a
+classification triggers REJECTED → ADD_FK promotion (high-confidence,
+non-false-positive), the skill annotates the corresponding `ADD_FK` row
+in DRY_RUN_PLAN output with `auto_promoted: true` so the user can see
+the audit trail before commit.
+
+Persistence belongs in `SQLCUBE_META` if added later; not in a
+separately-managed log schema.
 
 ## Cost
 
