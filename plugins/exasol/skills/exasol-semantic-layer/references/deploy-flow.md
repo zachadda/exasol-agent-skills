@@ -30,9 +30,45 @@ case "$HTTP" in
 esac
 ```
 
-If Path A is available but you need to authenticate: POST `/api/auth/login` with the persona (default `admin`) and password from `studio/backend/.env` (`STUDIO_PASSWORD_HASH` is the SHA-256 of the plaintext; the plaintext lives wherever the operator configured it). The endpoint returns a `session` cookie that every subsequent `/api/*` call must send.
+If Path A is available but you need to authenticate: POST `/api/auth/login` with the persona (default `admin`) and password from `studio/backend/.env` (`STUDIO_PASSWORD_HASH` is the SHA-256 of the plaintext; the plaintext lives wherever the operator configured it). The endpoint sets a `session` HttpOnly cookie that every subsequent `/api/*` call must send (use `curl -c cookies.txt` on login + `-b cookies.txt` on every follow-up).
+
+```bash
+# Login (live-verified 2026-05-14)
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"password":"<plaintext>","persona":"admin"}' \
+     -c /tmp/cookies.txt http://127.0.0.1:8001/api/auth/login
+# {"ok":true,"persona":"admin"}
+
+# Verify
+curl -s -b /tmp/cookies.txt http://127.0.0.1:8001/api/auth/me
+# {"authenticated":true,"persona":"admin"}
+```
+
+Dev escape hatch: setting `STUDIO_AUTH_BYPASS=true` in the backend environment makes `/api/auth/login` accept any password (still issues a real signed cookie). Use only on local Nano dev boxes — never on shared clusters.
 
 If Path A is unavailable, you can drive Path B from any pyexasol-capable runtime. The studio venv at `studio/backend/.venv/bin/python3` already has pyexasol 2.x installed — no separate `pip install` needed for local dev.
+
+### TLS handshake timeout under Nano memory pressure
+
+Live-verified 2026-05-14: under memory pressure on `exanano-sqlcube`, the backend's pyexasol WebSocket+TLS handshake intermittently times out with `_ssl.c:1063: The handshake operation timed out`. `/deploy/execute` returns:
+
+```json
+{
+  "success": false,
+  "virtual_schema_name": "",
+  "message": "Could not connect to Exasol: _ssl.c:1063: The handshake operation timed out...",
+  "failed_step": "validate_model",
+  "deployed_domain_ids": []
+}
+```
+
+The error is transient. Three correct responses:
+
+1. **Retry** — the same call usually succeeds within 1-3 attempts. The orchestrator should detect `failed_step == "validate_model"` with `handshake` in the message and retry up to 3× with a small backoff.
+2. **Lengthen the timeout** — backend `services/exasol.get_connection(..., timeout_seconds=15)` accepts an explicit timeout. Studio defaults to the pyexasol baseline. For mass-deploy or low-memory environments, push the explicit timeout higher in the calling code.
+3. **Switch to native transport** — `exapump` uses Exasol's native binary protocol and is unaffected by the TLS handshake delay. The `/deploy/execute` path currently uses pyexasol (WebSocket+TLS only); for the registry SQL portion you can drop to exapump if backend retry is unacceptable.
+
+This is environmental (Nano under load), not a skill bug — but agents should expect it and retry rather than surface a transient SSL error to the user.
 
 ---
 
@@ -112,16 +148,25 @@ Surfaced live 2026-05-14 against the `INVENTORY` fixture on `exanano-sqlcube`: 7
 
 ### Step 4 — parse the source DDL
 
+Preferred — server-side end-to-end:
+
 ```
-POST /api/sqlcube/introspect-sql?schema=ADVENTUREWORKS
+POST /api/ddl/introspect
+Body: { "schema_name": "ADVENTUREWORKS" }
 ```
 
-Returns the `parsed_ddl` dict consumed by every other endpoint. Schema-driven; reads `SYS.EXA_ALL_TABLES`, `SYS.EXA_ALL_COLUMNS`, `SYS.EXA_ALL_CONSTRAINTS` and assembles the canonical view.
+Runs the three SYS.EXA_ALL_* queries inside the backend and returns a fully populated `parsed_ddl` dict consumed by every other endpoint. Live-verified 2026-05-14: 9 tables, 11 join_paths, 1 fact + 8 dims auto-classified.
 
 Alternatives:
 
-- `POST /api/sqlcube/introspect-from-rows` if you already have a custom row payload from another connector.
+- `GET /api/sqlcube/introspect-sql?schema_name=ADVENTUREWORKS` — **returns only the SQL** the Workbench shell should run (one row: `{"sql": "..."}`). Caller is expected to execute that SQL via their own driver/exapump, then POST the result rows to `/api/sqlcube/introspect-from-rows` with `{schema_name, rows}`. Use when you want the SQL visible in a user-facing tab + query history audit rather than a hidden server-side call.
+- `POST /api/sqlcube/introspect-from-rows` (body `{schema_name, rows}`) — companion to the above; parses an already-fetched UNION-ALL row list.
 - `POST /api/sqlcube/source-metadata/parse` if a vendor BIM file (e.g. Power BI) is the source of truth.
+
+**Live-verified divergences from an earlier revision of this doc**:
+
+- Query param is `schema_name`, not `schema`. The shorter form returns a 422 "Field required" error.
+- `/api/sqlcube/introspect-sql` does NOT return `parsed_ddl` — only the SQL. The `/api/ddl/introspect` endpoint is the one-shot server-side variant.
 
 ### Step 5 — generate the SqlcubeModel
 
@@ -259,8 +304,9 @@ Base path: `/api/`. All POST unless noted. Reachable from agent over HTTP when s
 | `POST /sqlcube/validate` | `ValidateRequest { model, parsed_ddl? }` | `ValidationResponse` | **Step 6** — validate before deploy |
 | `POST /sqlcube/source-metadata/parse` | `SourceMetadataParseRequest { filename, text }` | parsed BIM dict | Parse a vendor BIM file (Power BI etc.) |
 | `POST /sqlcube/source-metadata/report` | `SourceMetadataReportRequest` | parity report | Compare BIM expectations vs live source |
-| `GET  /sqlcube/introspect-sql?schema=<S>` | (query string) | `parsed_ddl` dict | **Step 4** — read source schema via SYS.EXA_ALL_* |
-| `POST /sqlcube/introspect-from-rows` | row payload | `parsed_ddl` dict | Alt step 4 — use rows already in hand |
+| `POST /ddl/introspect` | `{ "schema_name": "<S>" }` | `parsed_ddl` dict | **Preferred Step 4** — server-side one-shot. Backend runs the three SYS.EXA_ALL_* queries and returns parsed_ddl. |
+| `GET  /sqlcube/introspect-sql?schema_name=<S>` | (query string — note `schema_name`, not `schema`) | `{ "sql": "..." }` | Alt step 4 — returns ONLY the introspection SQL for the agent / Workbench tab to run. Pair with `/introspect-from-rows`. |
+| `POST /sqlcube/introspect-from-rows` | `{ schema_name, rows }` | `parsed_ddl` dict | Companion to `/sqlcube/introspect-sql` — parses pre-fetched UNION-ALL rows. |
 | `POST /deploy/check` | `DeployCheckRequest { source_schema, domain_ids }` | `DeployCheckResponse { has_conflicts, conflicts }` | **Step 7** — pre-flight conflicts |
 | `POST /deploy/execute` | `SqlcubeModel` | `DeployResponse { success, virtual_schema_name, message, failed_step, deployed_domain_ids }` | **Step 8** — run `deployer.deploy(model)` end-to-end |
 
