@@ -174,16 +174,24 @@ Fix bundle (commit `ca05f1b`):
 - `sqlcube/adapter/measure_builder.lua`: `build_select_expr` + `build_derived_select_expr` now wrap with `CASE WHEN <predicate> THEN NULL ELSE <expr> END` AFTER ROUND/CAST when `user_mask_predicate` is set. Masked output is NULL, not zero or a wrong-typed default.
 - Adapter rebuilt via `sqlcube/adapter/build_adapter.py` and redeployed via `CREATE OR REPLACE LUA ADAPTER SCRIPT SQLCUBE.ADAPTER`. `ALTER VIRTUAL SCHEMA "SQLCUBE_<X>" REFRESH` after redeploy.
 
-Live-verified vs `exanano-demo-tour`:
+Live-verified vs `exanano-demo-tour` — double-axis showcase (Sales + Profit + Margin):
 
-| Persona | Rows | Top country | GM% |
-|---|---|---|---|
-| SYS | 6 | US | 0.4154 |
-| RCLS_CANADA | 1 | Canada | **None (masked)** |
-| RCLS_EUROPE | 3 | UK | **None (masked)** |
-| RCLS_EXEC | 6 | US | 0.4154 |
+| Persona | Rows | Top country | Sales | Profit | Margin |
+|---|---|---|---|---|---|
+| SYS | 6 | US | $29,358,677 | $12,080,883 | 0.4121 |
+| RCLS_CANADA | 1 | Canada | $1,977,845 | **NULL** | **NULL** |
+| RCLS_EUROPE | 3 | UK | $8,930,042 | **NULL** | **NULL** |
+| RCLS_EXEC | 6 | US | $29,358,677 | $12,080,883 | 0.4121 |
 
-Row mask + column mask both fire per persona — demo punchline doubled.
+Row mask + column mask both fire per persona — demo punchline doubled. Sales still aggregates (column itself isn't dropped — measure_builder nulls at expression level via `CASE WHEN <user_mask_predicate> THEN NULL ELSE <agg_expr> END`).
+
+`DEMO_RCLS_SCENARIOS` ships with two hidden attributes per restricted persona (`commit b314fee` on `demo-streamlined`):
+
+```python
+"hidden_attributes": ["Gross Margin Pct", "Gross Profit"]
+```
+
+Extension pattern: append any business-name string to `hidden_attributes` to mask additional measures. Adapter handles measure / derived_measure render-time wrapping automatically. Dim-level masking still requires the open extension noted below.
 
 Open extension: dimension-level user masking. `apply_attribute_user_security` already stamps `user_mask_predicate` onto matching `dim_meta`, but `main.lua` dim SELECT-render doesn't wrap yet. Add the same `CASE WHEN` wrap there for a complete story. Demo's hidden attribute is `"Gross Margin Pct"` (a measure), so this didn't block the demo.
 
