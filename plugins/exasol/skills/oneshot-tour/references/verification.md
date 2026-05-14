@@ -60,15 +60,26 @@ LIMIT 1;
 
 -- 5. Compose + run sample query.
 --    Both `MODEL_ID` and `VIRTUAL_COL` are case-preserving — quote them.
---    Quote the result aliases too. Exasol enforces ISO SQL reserved keywords
---    strictly; these all parse as syntax errors when used unquoted as aliases:
---      value, month, year, day, hour, minute, second, quarter, week,
---      date, time, timestamp, level, position, role, size, type.
---    Use either a quoted form (`AS "month"`) or a non-reserved alias
---    (`AS month_name`, `AS amount`, `AS bucket`). Quoted is safer for
---    LLM-generated SQL — agents tend to pick natural-language column
---    aliases that overlap with the reserved list.
---    Authoritative list: SYS.EXA_SQL_KEYWORDS.
+--    Quote the result aliases too. Exasol has 468 reserved keywords (per
+--    SYS.EXA_SQL_KEYWORDS WHERE RESERVED = TRUE), and natural-language
+--    column aliases routinely collide with them. The bulletproof rule:
+--    quote every alias unless you've verified it isn't reserved.
+--
+--    Common LLM-likely aliases that ARE reserved (verified against
+--    SYS.EXA_SQL_KEYWORDS on 2026-05-13):
+--      date components — year, month, day, hour, minute, second,
+--                        date, time, timestamp
+--      identity / data — value, name (note: NAME is non-reserved), source,
+--                        path, result, state, text, user, level, position
+--      ordering        — first, last, next, prior, order, group, asc, desc
+--      direction       — left, right, start, end
+--      object types    — table, view, schema, index, row, rows
+--      booleans        — true, false, null
+--    These are SAFE / non-reserved (verified — but always re-check):
+--      bucket, amount, name, size, type, role, week, quarter, total,
+--      count, sum, target, label, kind, period.
+--    Authoritative list:
+--      SELECT KEYWORD FROM SYS.EXA_SQL_KEYWORDS WHERE RESERVED = TRUE;
 SELECT
   "<dim_virtual_col>"                   AS "bucket",
   <agg_type>("<measure_virtual_col>")   AS "amount"
@@ -154,7 +165,7 @@ tour_state:
 | `SQLCUBE_REGISTRY.MODELS` empty for FACT_SCHEMA | "Virtual schema is live but no MODEL was registered. Semantic-layer skill misbehaved." |
 | `SQLCUBE_REGISTRY.MEASURES` has rows but none with `IS_VISIBLE = TRUE` | "Model `<id>` has measures registered but all are hidden. Re-run step 5 with `llm_enrichment: true`, or update IS_VISIBLE on at least one measure." |
 | `SQLCUBE_REGISTRY.DIMENSIONS` has rows but none with `IS_VISIBLE = TRUE` | Same as above for dims. Pick `COUNT(*)` as the measure and report "no visible dims; verified at fact-row-count level only". |
-| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script). Common cause: unquoted reserved-keyword alias — Exasol reserves `value, month, year, day, hour, minute, second, quarter, week, date, time, timestamp, level, position, role, size, type` (non-exhaustive — see `SYS.EXA_SQL_KEYWORDS`). Quote the alias or rename it. |
+| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script). Common cause: unquoted reserved-keyword alias — Exasol has 468 reserved keywords (`SELECT KEYWORD FROM SYS.EXA_SQL_KEYWORDS WHERE RESERVED = TRUE`). Likely offenders include date components (`year`, `month`, `day`, `hour`, `minute`, `second`, `date`, `time`, `timestamp`), identity words (`value`, `source`, `path`, `result`, `state`, `level`, `position`), ordering (`first`, `last`, `next`, `prior`, `order`, `group`, `asc`, `desc`), direction (`left`, `right`, `start`, `end`), and object types (`table`, `view`, `schema`, `index`, `row`, `rows`). Quote the alias or rename it. |
 | Sample query returns 0 rows | "Cube is live but query returned no rows. Possible model error: dim/measure don't connect to facts. Inspect `SQLCUBE_REGISTRY.JOINS` for the model." |
 
 On halt, Phase 5 does NOT run. Tour ends without a dashboard.
