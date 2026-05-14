@@ -1,29 +1,31 @@
 # LLM enrichment
 
-Runs when `llm_enrichment=true` (default). Generates business descriptions, measure definitions, and relationship names. Without this step the cube is structurally sound but cosmetically sparse — analysts see `DIM_CUSTOMER.SEGMENT` with no explanation.
+Runs when `llm_enrichment=true` (default). Generates business descriptions, measure proposals, attribute display names. Without this step the cube is structurally sound but cosmetically sparse — analysts see raw physical column names.
+
+Target schema: `SQLCUBE_REGISTRY` (configurable via `registry_schema` parameter).
 
 ## What gets enriched
 
 | Target | Enrichment | Where stored |
 |---|---|---|
-| MODELS.DESCRIPTION | One-paragraph summary of the cube's domain | SQLCUBE_META.MODELS |
-| DIMENSIONS.DIM_NAME | Business-friendly name (override default title-case) | SQLCUBE_META.DIMENSIONS |
-| DIMENSIONS.DESCRIPTION | One-sentence description per dimension | SQLCUBE_META.DIMENSIONS |
-| FACTS.GRAIN_DESCRIPTION | What one row means | SQLCUBE_META.FACTS |
-| MEASURES (new rows) | Business-specific measure definitions beyond the structural defaults | SQLCUBE_META.MEASURES |
-| MEASURES.DESCRIPTION | Description of each measure | SQLCUBE_META.MEASURES |
-| RELATIONSHIPS.RELATIONSHIP_NAME | Human-readable phrasing for FK relationships | SQLCUBE_META.RELATIONSHIPS |
-| COLUMNS.DISPLAY_NAME | Override default title-case for column names | SQLCUBE_META.COLUMNS |
-| COLUMNS.DESCRIPTION | Per-column description | SQLCUBE_META.COLUMNS |
+| DOMAINS.DOMAIN_NAME | Business label for the domain | `SQLCUBE_REGISTRY.DOMAINS.DOMAIN_NAME` |
+| DOMAINS.DESCRIPTION | One-paragraph cube summary | `SQLCUBE_REGISTRY.DOMAINS.DESCRIPTION` |
+| MODELS.MODEL_LABEL | Business name for the model (default = title-cased fact table) | `SQLCUBE_REGISTRY.MODELS.MODEL_LABEL` |
+| ATTRIBUTES.BUSINESS_NAME | Domain-level display label per physical column | `SQLCUBE_REGISTRY.ATTRIBUTES.BUSINESS_NAME` |
+| ATTRIBUTES.DISPLAY_TYPE / DISPLAY_SCALE | UI rendering hints | `SQLCUBE_REGISTRY.ATTRIBUTES` |
+| DIMENSIONS.VIRTUAL_COL | Per-model display name (often inherits from ATTRIBUTES) | `SQLCUBE_REGISTRY.DIMENSIONS.VIRTUAL_COL` |
+| MEASURES (new rows) | Business-specific measure proposals beyond the structural defaults | `SQLCUBE_REGISTRY.MEASURES` |
+| MEASURES.VIRTUAL_COL / FORMAT_MASK | Display name + format mask per measure | `SQLCUBE_REGISTRY.MEASURES` |
+| JOIN_PATHS | Domain-level alternative join graph (renames + roles) | `SQLCUBE_REGISTRY.JOIN_PATHS` |
 
 ## Inputs to the LLM
 
 For each cube, build a context blob with:
 
-1. **Source schema name + table names** (e.g., "ADVENTUREWORKS: DIM_CUSTOMER, DIM_PRODUCT, DIM_DATE, FACT_SALES")
+1. **Source schema name + table names** (e.g., "ADVENTUREWORKS: DIMCUSTOMER, DIMPRODUCT, DIMDATE, FACTINTERNETSALES")
 2. **DDL per table** — `SELECT * FROM SYS.EXA_DBA_COLUMNS WHERE COLUMN_SCHEMA = '<S>' AND COLUMN_TABLE = '<T>'`
 3. **Sample rows per table** — `SELECT * FROM <S>.<T> SAMPLE 10` (Exasol's SAMPLE clause is cheap)
-4. **Optimize-emitted join graph** — RELATIONSHIPS structure already known from upstream
+4. **Optimize-emitted join graph** — JOINS / JOIN_PATHS structure already populated by the structural pass from declared FKs
 5. **Domain hint** if available — source name (`adventureworks` → retail), or user-passed `domain_hint` parameter
 
 Build the prompt around domain hint + schema + samples. Avoid sending row data that contains PII — sample with `SELECT col1, col2 ... FROM ... SAMPLE 10` and strip columns named `EMAIL`, `SSN`, `PASSWORD`, `PHONE`, `TAX_ID` before serialization.
@@ -42,7 +44,7 @@ Tables and structure:
 [DDL + 5–10 sample rows per table, joined into one blob]
 
 Existing join graph (from FK discovery):
-[RELATIONSHIPS rows as a table]
+[JOINS + JOIN_PATHS rows as a table]
 
 Existing structural measures (default aggregations):
 [MEASURES rows as a table]
@@ -81,7 +83,7 @@ Token budget: ~5–15K tokens total per cube of 10 tables. Roughly $0.02–$0.05
 
 ## Validation
 
-Before writing LLM output to SQLCUBE_META:
+Before writing LLM output to SQLCUBE_REGISTRY:
 
 1. **Reject hallucinated tables.** Every `physical_table` in the JSON must exist in `SYS.EXA_ALL_TABLES` for the source schema. If not → drop that entry, log warning.
 2. **Reject hallucinated columns.** Every `physical_column` and every column referenced in a measure `expression` must exist in `SYS.EXA_ALL_COLUMNS`. Parse the expression for identifiers and cross-check.

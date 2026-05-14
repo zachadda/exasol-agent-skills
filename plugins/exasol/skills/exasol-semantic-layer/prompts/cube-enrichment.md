@@ -1,19 +1,19 @@
 # Cube enrichment (main prompt)
 
-The big one. Single LLM call per cube. Generates model description, dimension/fact business names, additional measures, relationship renames, and column display names. Output drives the bulk of SQLCUBE_META rows.
+The big one. Single LLM call per cube. Generates domain description, model labels, attribute display names, additional measures, role-playing dim labels. Output maps directly to `SQLCUBE_REGISTRY` rows.
 
 ## When used
 
-`llm_enrichment=true` (default). After structural defaults are computed but before SQLCUBE_META INSERTs run.
+`llm_enrichment=true` (default). After structural defaults are computed but before INSERT into the registry.
 
 ## System prompt
 
 ```
-You are designing the business surface of a semantic layer over a database schema.
+You are designing the business surface of a semantic layer over an Exasol database schema.
 
-Your output will be inserted into a metadata catalog (SQLCUBE_META) that powers natural-language
-query interfaces. Analysts will see your descriptions and measure names. Be specific, concise,
-and grounded in the actual schema. Never invent tables or columns.
+Your output populates a metadata catalog (SQLCUBE_REGISTRY) that powers natural-language query
+interfaces. Analysts will see your descriptions, business names, and measure proposals. Be
+specific, concise, grounded in the actual schema. Never invent tables or columns.
 
 Output strict JSON conforming to the requested schema. No prose, no markdown, no commentary.
 ```
@@ -21,7 +21,7 @@ Output strict JSON conforming to the requested schema. No prose, no markdown, no
 ## User prompt template
 
 ```
-Schema name: <SOURCE_SCHEMA>
+Source schema: <SOURCE_SCHEMA>
 Domain: <DOMAIN_FROM_domain-detection.md_OR_user_supplied>
 Sub-domain: <SUB_DOMAIN_OR_unspecified>
 
@@ -38,70 +38,73 @@ Sub-domain: <SUB_DOMAIN_OR_unspecified>
 <PIPE_DELIMITED_SAMPLE_OR_no-samples-available>
 </FOR_EACH_TABLE>
 
-=== Discovered relationships (from optimize) ===
+=== Discovered FK join graph ===
 
-<FOR_EACH_RELATIONSHIP>
-- <FACT_TABLE>.<FK_COL> → <DIM_TABLE>.<PK_COL>  (role: <ROLE_OR_none>)
-</FOR_EACH_RELATIONSHIP>
+<FOR_EACH_DECLARED_FK>
+- <FACT_SCHEMA>.<FACT_TABLE>.<FK_COL> → <DIM_SCHEMA>.<DIM_TABLE>.<PK_COL>
+</FOR_EACH_DECLARED_FK>
 
-=== Structural measures (default aggregations already generated) ===
+=== Models being created ===
+
+<FOR_EACH_MODEL>
+- model_id: <MODEL_ID>
+  fact_table: <FACT_SCHEMA>.<FACT_TABLE>
+  domain_id: <DOMAIN_ID>
+  grain_key: <COMMA_SEPARATED_PK_COLS>
+</FOR_EACH_MODEL>
+
+=== Structural measures (already generated, do not duplicate) ===
 
 <FOR_EACH_DEFAULT_MEASURE>
-- <FACT>.<MEASURE_NAME>: <EXPRESSION> [<AGGREGATION>]
+- model=<MODEL_ID>, virtual_col=<VIRTUAL_COL>, agg_type=<AGG_TYPE>, physical_expr=<PHYSICAL_EXPR>
 </FOR_EACH_DEFAULT_MEASURE>
 
 === Output JSON schema ===
 
 {
-  "model_description": "<2–4 sentences describing this cube's domain coverage>",
+  "domain": {
+    "domain_id": "<provided in input, echo>",
+    "domain_name": "<readable business name>",
+    "description": "<2-4 sentences describing the domain's coverage>"
+  },
 
-  "dimensions": [
+  "models": [
     {
-      "physical_table": "<TABLE_NAME>",
-      "business_name": "<readable name, Title Case, no underscores>",
-      "description": "<one sentence>",
-      "columns": [
-        {
-          "physical_column": "<COL_NAME>",
-          "display_name": "<Title Case>",
-          "description": "<one sentence or empty string>"
-        }
-      ]
+      "model_id": "<provided in input, echo>",
+      "model_label": "<readable business name, no underscores>",
+      "grain_description": "<one sentence — what one fact row represents>"
     }
   ],
 
-  "facts": [
+  "attributes": [
     {
-      "physical_table": "<TABLE_NAME>",
-      "business_name": "<readable name>",
-      "grain": "<one sentence — what does ONE row represent?>",
-      "columns": [
-        {
-          "physical_column": "<COL_NAME>",
-          "display_name": "<Title Case>",
-          "description": "<one sentence or empty string>"
-        }
-      ]
+      "physical_table": "<SCHEMA.TABLE>",
+      "physical_col": "<COL>",
+      "business_name": "<Title Case, no underscores>",
+      "description": "<one sentence or empty>",
+      "display_type": "text" | "integer" | "decimal" | "currency" | "percent" | "date" | "datetime",
+      "display_scale": 0
     }
   ],
 
   "additional_measures": [
     {
-      "fact": "<FACT_BUSINESS_NAME>",
-      "name": "<measure name, Title Case, distinct from defaults>",
-      "expression": "<SQL expression, references columns in fact OR joined dims; no SUM()/AVG() wrapper>",
-      "aggregation": "SUM" | "AVG" | "COUNT" | "COUNT_DISTINCT" | "MIN" | "MAX",
-      "format": "currency_usd" | "currency_eur" | "percent" | "integer" | "decimal_2" | "decimal_4" | "bytes" | "duration_seconds",
-      "description": "<one sentence>"
+      "model_id": "<MODEL_ID>",
+      "virtual_col": "<Business name, Title Case, distinct from defaults>",
+      "agg_type": "SUM" | "AVG" | "COUNT" | "COUNT_DISTINCT" | "MIN" | "MAX",
+      "physical_expr": "<inner expression using alias 'f' for fact and dim aliases as listed>",
+      "filter_expr": "<optional WHERE-style condition, or empty>",
+      "data_type": "<Exasol type literal, e.g. DECIMAL(19,4)>",
+      "format_mask": "<Excel-style format, e.g. $#,##0.00 or 0.00%>"
     }
   ],
 
-  "relationship_renames": [
+  "role_playing": [
     {
-      "fact": "<FACT_PHYSICAL_TABLE>",
-      "dim": "<DIM_PHYSICAL_TABLE>",
-      "fk_column": "<FACT_FK_COLUMN>",
-      "new_name": "<business-friendly relationship name>"
+      "model_id": "<MODEL_ID>",
+      "dim_table": "<SCHEMA.DIMTABLE>",
+      "fact_fk_col": "<column on the fact, e.g. ORDERDATEKEY>",
+      "role_label": "<short prefix, e.g. OrderDate, ShipDate>"
     }
   ]
 }
@@ -110,65 +113,58 @@ Sub-domain: <SUB_DOMAIN_OR_unspecified>
 
 1. NEVER reference tables / columns that aren't in the schema above. The system will reject
    hallucinated identifiers.
-2. Grain descriptions are critical. For each fact, say what "one row" means with specifics
-   (e.g., "One row per order line item, capturing quantity and price").
-3. additional_measures is your chance to add business-specific aggregations beyond the structural
-   defaults. Examples: gross-margin formulas, customer-acquisition cost, net retention rates.
-   Don't repeat the defaults. Don't propose measures the data can't support.
-4. expression must be valid Exasol SQL referencing only listed columns. Use NULLIF for divisors.
-5. Relationship renames are optional. Only suggest when the default name (which is the FK column
-   stem) is misleading. Skip the field entirely when defaults are fine.
-6. Empty descriptions are fine for column rows where the column name already speaks for itself
-   (e.g., FIRST_NAME → just display_name "First Name", empty description).
-7. Cap additional_measures at 5 per fact. Quality over quantity.
-8. NEVER include PII guesses. If a column was redacted in samples, don't fabricate what it means.
-9. NEVER produce DDL, INSERT statements, or any executable SQL outside `expression` fields.
+2. grain_description is critical. Say what "one row" means specifically (e.g., "One row per
+   order line item, capturing quantity and price").
+3. additional_measures is your chance for domain-specific aggregations beyond the structural
+   defaults. Examples: gross margin, AOV, on-time rate, return rate. Don't repeat defaults.
+4. physical_expr uses alias 'f' for the fact (the adapter generates `FROM <fact> f`). When
+   referencing dim columns, use their dim alias from the JOINS structural pass (e.g., 'dim',
+   'dim1') — the system supplies these in a follow-up validation pass; LLM doesn't need to
+   pick aliases.
+5. Use NULLIF for divisors. Always.
+6. role_playing entries are required when a fact has two or more FKs to the same dim. The
+   structural pass detects the FKs; you provide the role labels. If a fact has only one
+   FK to a given dim, omit it from role_playing.
+7. Empty descriptions OK when the business_name is self-evident (e.g., "First Name").
+8. Cap additional_measures at 8 per model.
+9. NEVER include PII guesses. PII columns are redacted before samples reach you.
+10. NEVER produce DDL or DELETE / INSERT — only the JSON fields requested.
 ```
 
 ## Validation
 
-The skill runs each LLM output through these checks before any SQLCUBE_META INSERT:
+Before any registry INSERT:
 
-1. **Identifier resolution.** Every `physical_table` and `physical_column` must exist in
-   `SYS.EXA_ALL_TABLES` / `SYS.EXA_ALL_COLUMNS` for the source schema. Drop hallucinated entries
-   to a `rejected.log` file alongside the manifest.
+1. **Identifier resolution.** Every `physical_table` / `physical_col` referenced must exist in `SYS.EXA_ALL_TABLES` / `SYS.EXA_ALL_COLUMNS`. Drop hallucinated entries to `rejected.log`.
 
-2. **Expression parses.** Each `additional_measures.expression` is dry-run:
+2. **Expression dry-run.** For each `additional_measures.physical_expr`, run:
    ```sql
-   SELECT <expression> FROM <source_schema>.<physical_fact> LIMIT 0;
+   SELECT <physical_expr> FROM <fact_schema>.<fact_table> f LIMIT 0;
    ```
-   Errors → drop the measure, log to `rejected.log`.
+   Errors → drop the measure, log.
 
-3. **No duplicate measure names.** If LLM proposed `Total Revenue` and the structural defaults
-   already have `Total Revenue` → drop the LLM version.
+3. **No duplicates.** If LLM proposes a measure with `virtual_col` matching a structural default → drop the LLM version.
 
-4. **Format hint allowlist.** Only the 8 listed values. Anything else → default to `integer`
-   for SUM/COUNT, `decimal_2` for AVG.
+4. **Format mask validity.** Quick sanity check (must contain `0`, `#`, or one of `%$€`). Empty string is accepted.
 
-5. **Business name conflict.** Two dimensions / facts cannot share a `business_name`. On
-   collision, keep the longer-named entity (more descriptive), demote the other to add a
-   disambiguator (`Customer (Account)`).
+5. **Agg/expr compatibility.** SUM on VARCHAR / BOOLEAN expression → reject. AVG / SUM on COUNT_DISTINCT result → reject.
 
-6. **Description length.** > 500 chars → truncate at first sentence boundary. Empty string
-   passes through to SQLCUBE_META as NULL.
+6. **Role-playing required.** If a fact has multiple FKs to the same dim AND the LLM didn't supply `role_playing` entries, halt with: "Role-playing dimension detected (DIMDATE referenced 2x from FACTINTERNETSALES). Re-run with role labels or supply dimensions_overrides YAML."
 
-## Storage
+## Storage mapping
 
-Validated rows get distributed across SQLCUBE_META tables per `meta-model.md`. The full mapping:
-
-| Output field | SQLCUBE_META target |
+| Output field | Registry destination |
 |---|---|
-| `model_description` | MODELS.DESCRIPTION |
-| `dimensions[*].business_name` | DIMENSIONS.DIM_NAME |
-| `dimensions[*].description` | DIMENSIONS.DESCRIPTION |
-| `facts[*].business_name` | FACTS.FACT_NAME |
-| `facts[*].grain` | FACTS.GRAIN_DESCRIPTION |
-| `dimensions[*].columns / facts[*].columns` | COLUMNS rows |
-| `additional_measures` | MEASURES rows (new, beyond defaults) |
-| `relationship_renames` | RELATIONSHIPS.RELATIONSHIP_NAME updates |
+| `domain.domain_name` | `SQLCUBE_REGISTRY.DOMAINS.DOMAIN_NAME` |
+| `domain.description` | `SQLCUBE_REGISTRY.DOMAINS.DESCRIPTION` |
+| `models[*].model_label` | `SQLCUBE_REGISTRY.MODELS.MODEL_LABEL` |
+| `models[*].grain_description` | `SQLCUBE_REGISTRY.MODELS.GRAIN_KEY` (separate sentence stored in the structural pass as the column list); business description is stored at domain level since MODELS doesn't have a description column |
+| `attributes[*].business_name` | `SQLCUBE_REGISTRY.ATTRIBUTES.BUSINESS_NAME` |
+| `attributes[*].display_type` / `display_scale` | `SQLCUBE_REGISTRY.ATTRIBUTES.DISPLAY_TYPE` / `DISPLAY_SCALE` |
+| `additional_measures[*]` | `SQLCUBE_REGISTRY.MEASURES` (new rows; the structural pass already wrote the defaults) |
+| `role_playing[*]` | Influences `SQLCUBE_REGISTRY.JOINS` (extra rows for each role) and `SQLCUBE_REGISTRY.DIMENSIONS` (rows duplicated per role with role-prefixed VIRTUAL_COL) |
 
-User-supplied overrides (`measures_overrides.yaml` / `dimensions_overrides.yaml`) apply AFTER
-LLM output and win on conflict.
+User-supplied YAML overrides apply AFTER LLM output and win on conflict (see `references/meta-model.md` YAML format).
 
 ## Cost
 
@@ -181,60 +177,54 @@ Token budget scales with schema size. Rough numbers per call:
 | 20 | ~12K | ~4K | ~$0.04 | ~$0.20 |
 | 50 | ~30K | ~10K | ~$0.10 | ~$0.50 |
 
-Schemas > 50 tables: split into multiple cube-creation invocations OR pre-supply overrides for
-the well-understood subset, restricting the LLM to the unknown portion.
+Schemas > 50 tables: split into multiple invocations OR pre-supply overrides.
 
 ## Example output (truncated)
 
-For ADVENTUREWORKS with 4 tables:
+For ADVENTUREWORKS with one fact + four dims:
 
 ```json
 {
-  "model_description": "AdventureWorks sales cube. Covers customer demographics, product catalog, and order-line revenue. Time dimension supports order-date and ship-date roles.",
-  "dimensions": [
+  "domain": {
+    "domain_id": "internet_sales",
+    "domain_name": "Internet Sales",
+    "description": "Direct-to-consumer online sales cube. One row per order line item, with attribution to customer, product, date (order and ship), and sales territory."
+  },
+  "models": [
     {
-      "physical_table": "DIM_CUSTOMER",
-      "business_name": "Customer",
-      "description": "Individual and corporate buyers, including segment and geography.",
-      "columns": [
-        {"physical_column": "FIRST_NAME", "display_name": "First Name", "description": ""},
-        {"physical_column": "SEGMENT", "display_name": "Segment", "description": "Marketing segment classification (Consumer, Corporate, Home Office)."}
-      ]
-    },
-    ...
-  ],
-  "facts": [
-    {
-      "physical_table": "FACT_SALES",
-      "business_name": "Sales",
-      "grain": "One row per order line item, capturing quantity, unit price, discount, and tax for a specific product on an order date.",
-      "columns": [
-        {"physical_column": "QUANTITY", "display_name": "Quantity", "description": ""},
-        {"physical_column": "UNIT_PRICE", "display_name": "Unit Price", "description": "Catalog price at time of order."}
-      ]
+      "model_id": "factinternetsales",
+      "model_label": "Internet Sales",
+      "grain_description": "One row per order line item — quantity, unit price, discount, tax, freight for a single product on a single order date."
     }
+  ],
+  "attributes": [
+    {"physical_table": "ADVENTUREWORKS.DIMCUSTOMER", "physical_col": "FIRSTNAME", "business_name": "First Name", "description": "", "display_type": "text", "display_scale": 0},
+    {"physical_table": "ADVENTUREWORKS.DIMPRODUCT", "physical_col": "COLOR", "business_name": "Color", "description": "Product color from catalog.", "display_type": "text", "display_scale": 0},
+    {"physical_table": "ADVENTUREWORKS.DIMPRODUCT", "physical_col": "STANDARDCOST", "business_name": "Standard Cost", "description": "Cost basis used for gross-margin calculation.", "display_type": "currency", "display_scale": 2}
   ],
   "additional_measures": [
     {
-      "fact": "Sales",
-      "name": "Net Revenue",
-      "expression": "QUANTITY * UNIT_PRICE * (1 - DISCOUNT) - TAX",
-      "aggregation": "SUM",
-      "format": "currency_usd",
-      "description": "Revenue after discount and tax."
+      "model_id": "factinternetsales",
+      "virtual_col": "Net Revenue",
+      "agg_type": "SUM",
+      "physical_expr": "f.SALESAMOUNT - f.TAXAMT - f.FREIGHT",
+      "filter_expr": "",
+      "data_type": "DECIMAL(19,4)",
+      "format_mask": "$#,##0.00"
     },
     {
-      "fact": "Sales",
-      "name": "Avg Discount Rate",
-      "expression": "DISCOUNT",
-      "aggregation": "AVG",
-      "format": "percent",
-      "description": "Average per-line discount rate."
+      "model_id": "factinternetsales",
+      "virtual_col": "Gross Margin %",
+      "agg_type": "AVG",
+      "physical_expr": "(f.UNITPRICE - f.TOTALPRODUCTCOST) / NULLIF(f.UNITPRICE, 0)",
+      "filter_expr": "",
+      "data_type": "DECIMAL(9,4)",
+      "format_mask": "0.00%"
     }
   ],
-  "relationship_renames": [
-    {"fact": "FACT_SALES", "dim": "DIM_DATE", "fk_column": "ORDER_DATE", "new_name": "Order Date"},
-    {"fact": "FACT_SALES", "dim": "DIM_DATE", "fk_column": "SHIP_DATE", "new_name": "Ship Date"}
+  "role_playing": [
+    {"model_id": "factinternetsales", "dim_table": "ADVENTUREWORKS.DIMDATE", "fact_fk_col": "ORDERDATEKEY", "role_label": "OrderDate"},
+    {"model_id": "factinternetsales", "dim_table": "ADVENTUREWORKS.DIMDATE", "fact_fk_col": "SHIPDATEKEY",  "role_label": "ShipDate"}
   ]
 }
 ```

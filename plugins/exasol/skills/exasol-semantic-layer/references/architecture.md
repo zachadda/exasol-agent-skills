@@ -1,145 +1,160 @@
 # SQLCube semantic layer architecture
 
-Read first. Five-minute orientation to the moving parts so the rest of the references make sense.
+Read first. Five-minute orientation to how the parts compose. The rest of the references assume this picture.
 
 ## The pieces
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ Physical schema (e.g., ADVENTUREWORKS)                    │
-│   FACT_SALES, DIM_CUSTOMER, DIM_PRODUCT, DIM_DATE, ...    │
-│   PKs declared, FKs declared (via exasol-optimize)        │
-└──────────────────────────────────────────────────────────┘
-                          ▲ underlying tables
-                          │
-┌──────────────────────────────────────────────────────────┐
-│ Virtual schema (e.g., ADVENTUREWORKS_CUBE)                │
-│   CREATE VIRTUAL SCHEMA ... USING SQLCUBE.ADAPTER WITH    │
-│     MODEL_NAME='ADVENTUREWORKS_CUBE'                      │
-└──────────────────────────────────────────────────────────┘
-                          ▲ queries
-                          │
-┌──────────────────────────────────────────────────────────┐
-│ SQLCUBE.ADAPTER (Exasol Virtual Schema adapter UDF)       │
-│   Implements pushdown / capabilities / refresh callbacks  │
-│   Reads model definition from SQLCUBE_META                │
-│   Rewrites queries → SQL against physical schema          │
-└──────────────────────────────────────────────────────────┘
-                          ▲ uses
-                          │
-┌──────────────────────────────────────────────────────────┐
-│ SQLCUBE_META schema (system-of-record for cube metadata)  │
-│   MODELS         — one row per cube                       │
-│   DIMENSIONS     — dimension entities (DIM tables)        │
-│   FACTS          — fact entities (FACT tables)            │
-│   MEASURES       — aggregates over fact columns           │
-│   RELATIONSHIPS  — FK-derived named joins                 │
-│   COLUMNS        — display names, descriptions, types     │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ Source schema (e.g., ADVENTUREWORKS)                            │
+│   FACT tables: FACTINTERNETSALES, FACTRESELLERSALES, ...        │
+│   DIM tables:  DIMCUSTOMER, DIMPRODUCT, DIMDATE, ...            │
+│   PKs + FKs declared by exasol-optimize                         │
+└────────────────────────────────────────────────────────────────┘
+                            ▲ physical reads at query time
+                            │
+┌────────────────────────────────────────────────────────────────┐
+│ SQLCUBE.ADAPTER  (Lua adapter UDF in schema SQLCUBE)            │
+│   On every query against the virtual schema:                    │
+│     1. parse incoming SELECT                                    │
+│     2. read SQLCUBE_REGISTRY rows for the requested model       │
+│     3. emit one wide SELECT against physical tables             │
+│        (JOINS produce the join graph, MEASURES produce the      │
+│         aggregations, DIMENSIONS produce the dim columns)       │
+│   Bundled Lua source: factory-foundation/sqlcube/adapter/       │
+└────────────────────────────────────────────────────────────────┘
+                            ▲ reads runtime
+                            │
+┌────────────────────────────────────────────────────────────────┐
+│ SQLCUBE_REGISTRY  (metadata schema; configurable name)          │
+│   DOMAINS              business grouping (above models)         │
+│   MODELS               one row per fact grain                   │
+│   DIMENSIONS           column-level — virtual cols from dims    │
+│   MEASURES             inner expressions + aggregation type     │
+│   DERIVED_MEASURES     formulas over other measures             │
+│   JOINS                ordered join graph per model             │
+│   ATTRIBUTES           domain-level display labels              │
+│   JOIN_PATHS           alternative join graph at domain level   │
+│   RCLS_ROW_POLICIES    row-level security                       │
+│   RCLS_ATTRIBUTE_POLICIES  column-level security                │
+└────────────────────────────────────────────────────────────────┘
+                            ▲ adapter resolves names against
+                            │
+┌────────────────────────────────────────────────────────────────┐
+│ SQLCUBE_<LAYER_ID>  (virtual schema seen by analysts / MCP)     │
+│   "model_id_1"   ← lowercase virtual table                      │
+│   "model_id_2"                                                  │
+│   ...                                                           │
+│   Created by: CREATE VIRTUAL SCHEMA ... USING SQLCUBE.ADAPTER   │
+│     WITH IS_LOCAL='true' LAYER_ID='<id>' MODEL_IDS='<list>'     │
+└────────────────────────────────────────────────────────────────┘
+                            ▲ queries
+                            │
+                        analyst / MCP / dashboard
 ```
 
-The flow is unidirectional. Queries hit the virtual schema, ADAPTER intercepts, ADAPTER reads SQLCUBE_META to figure out what each virtual identifier maps to, ADAPTER rewrites into physical SQL, Exasol's optimizer runs it. No materialization. No caching. No state outside SQLCUBE_META.
+The flow is unidirectional. Every query against the virtual schema triggers the adapter, the adapter loads the registry, the adapter emits one wide SELECT against physical tables, Exasol executes. No caching. No materialization. Stateless except for SQLCUBE_REGISTRY itself.
+
+## Models, Domains, and the two-layer hierarchy
+
+This is the part most likely to surprise.
+
+| Layer | Purpose | Table | Identifier |
+|---|---|---|---|
+| **DOMAINS** | Business-grouping concept above models. Holds attribute renames and alternative join paths. | `DOMAINS` | `DOMAIN_ID` (e.g., `internet_sales`) |
+| **MODELS** | One per fact-table grain. Carries the join graph and measures specific to that fact. | `MODELS` | `MODEL_ID` (e.g., `factinternetsales`, `factresellersales`) |
+
+Why two layers:
+
+- **Multiple models per domain.** A `sales` domain can have `internet_sales`, `reseller_sales`, `store_sales` models — different facts but they share dim renames and a single business surface.
+- **Multiple grains per fact.** Same physical fact may appear as several models: atomic (`factinternetsales`), by-month rollup (`factinternetsales_by_month`), by-product (`factinternetsales_by_dimproduct`). Each is a separate MODELS row; each is a separate virtual table inside the same virtual schema.
+- **Attributes vs Dimensions.** `ATTRIBUTES` (domain-level) define the display name and type for a physical column. `DIMENSIONS` (model-level) pull a chosen subset of those attribute physicals into a specific model's surface. The same column can be exposed by multiple models via DIMENSIONS rows, each referencing a possibly-different alias.
+
+For simple use cases (one fact, one domain), Domain and Model end up nearly redundant. That's fine — populate both with the same id and move on. The two-layer separation matters when the model count grows.
+
+## Virtual schema naming convention
+
+Generated by `factory-foundation/studio/backend/services/sqlcube_builder.py:semantic_layer_virtual_schema_name()`:
+
+```python
+def semantic_layer_virtual_schema_name(layer_id: str | None) -> str:
+    return f"SQLCUBE_{_safe_identifier_token(layer_id)}"
+```
+
+`_safe_identifier_token`:
+- Uppercases input
+- Replaces non-alphanumeric chars with `_`
+- Collapses adjacent underscores
+- Truncates to 120 chars
+- Prefixes with `SEMANTIC_` if input starts with a digit
+- Falls back to `SEMANTIC` if input is empty after sanitization
+
+Layer id is derived by:
+1. Sanitized `source_schema` if available (preferred)
+2. Sanitized first domain's `domain_id` (fallback)
+3. Literal `SEMANTIC` (last resort)
+
+So for `source_schema='ADVENTUREWORKS'`, the virtual schema is `SQLCUBE_ADVENTUREWORKS`. For a fixture that crosses schemas (rare), domain id wins.
+
+## CREATE VIRTUAL SCHEMA — two modes
+
+The studio backend supports two property shapes:
+
+### Multi-domain (current, preferred)
+
+```sql
+CREATE VIRTUAL SCHEMA "SQLCUBE_ADVENTUREWORKS"
+  USING SQLCUBE.ADAPTER
+  WITH
+    IS_LOCAL = 'true'
+    LAYER_ID = 'ADVENTUREWORKS'
+    MODEL_IDS = 'factinternetsales,factresellersales,factinternetsales_by_month';
+```
+
+One virtual schema, multiple models. Each model id from `MODEL_IDS` becomes a separate virtual table. Inside the schema: `SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"` works.
+
+### Single-model (legacy)
+
+```sql
+CREATE VIRTUAL SCHEMA "SQLCUBE_FACTINTERNETSALES"
+  USING SQLCUBE.ADAPTER
+  WITH
+    IS_LOCAL = 'true'
+    MODEL_ID = 'factinternetsales';
+```
+
+One virtual schema, one model. Older deployments shipped this way — each model got its own virtual schema. Still supported, still works. New flows should use multi-domain unless there's a specific reason.
+
+This skill defaults to multi-domain. Set `mode=single_model` parameter to fall back when interacting with legacy fixtures.
 
 ## Why this shape
 
-**Q: Why not just use Exasol views?**
-A: Views are stateless. They have no description, no relationship metadata, no measure formulas, no business names. SQLCUBE_META is where semantic information lives. Views are a degenerate semantic layer.
+**Q: Why metadata in tables, not config files?**
+A: Exasol-native and queryable. Cube definition lives in the same engine that serves the queries. Backup is `EXPORT SCHEMA`. Editing is plain SQL. The registry is a system catalog you can JOIN against.
 
-**Q: Why a Virtual Schema instead of generated views?**
-A: Virtual Schemas have a query-rewrite hook (the ADAPTER UDF). We can do things like:
-- Rewrite `SELECT total_revenue FROM cube.sales` into `SELECT SUM(LINEITEM.QUANTITY * LINEITEM.UNITPRICE * (1 - LINEITEM.DISCOUNT)) FROM ...`
-- Auto-join based on RELATIONSHIPS metadata when the query references columns from multiple dimensions
-- Surface helpful errors when a query references a measure that doesn't apply to the requested grain
+**Q: Why one wide denormalized result instead of star-schema joins?**
+A: That's the SQLCube design choice. Analysts ask "revenue by region by month" — they want a flat result. The adapter resolves which dims to join, which measures to aggregate, what to group by, all from a single SELECT. The user never writes JOIN clauses.
 
-None of that is possible with plain views.
+**Q: Why is the adapter Lua?**
+A: Exasol's Virtual Schema adapter contract is a Lua or Python UDF. SQLCube picked Lua for size + startup cost. Source in `factory-foundation/sqlcube/adapter/`, built via `build_adapter.py`, deployed as `CREATE OR REPLACE LUA ADAPTER SCRIPT SQLCUBE.ADAPTER`.
 
-**Q: Why store metadata in tables, not files?**
-A: Exasol-native. The cube definition is queryable, joinable, versionable via standard SQL. Backup is `EXPORT SCHEMA`. No file system to lose, no YAML to drift from production. Bonus: the LLM enrichment step writes rows; future cube editors are also just SQL.
+**Q: Why DELETE-then-INSERT instead of MERGE?**
+A: Exasol doesn't have MERGE in v0.1 of this skill's target compatibility window. DELETE-by-domain_id then INSERT is a simple atomic-ish upsert that handles renames, removed measures, and structural changes uniformly. The skill never tries to diff; it always rebuilds the domain.
 
-**Q: How does this differ from dbt's semantic layer?**
-A: dbt's semantic layer is YAML → compiled SQL → executed by the warehouse. Ours is SQL → SQLCUBE_META → executed by the warehouse via ADAPTER. Same conceptual layers, different storage / runtime. dbt is more declarative and version-control-friendly; ours is more database-native and live-editable.
-
-## What SQLCUBE_META looks like
-
-Five core tables. Schema lives in `SQLCUBE_META`. Detail in `meta-model.md`.
-
-### MODELS
-
-One row per cube.
-
-| Column | Type | Purpose |
-|---|---|---|
-| MODEL_NAME | VARCHAR | Primary key. Matches virtual schema name. |
-| SOURCE_SCHEMA | VARCHAR | Physical schema this cube reads from. |
-| DESCRIPTION | VARCHAR | Business-level description (LLM-generated or user) |
-| CREATED_AT | TIMESTAMP | Audit |
-| UPDATED_AT | TIMESTAMP | Audit |
-| OWNER | VARCHAR | User who created the cube |
-
-### DIMENSIONS
-
-| Column | Type | Purpose |
-|---|---|---|
-| MODEL_NAME | VARCHAR | FK → MODELS |
-| DIM_NAME | VARCHAR | Business name (e.g., "Customer", LLM-derived from DIM_CUSTOMER) |
-| PHYSICAL_TABLE | VARCHAR | Underlying DIM table |
-| PK_COLUMN | VARCHAR | From exasol-optimize discovery |
-| DESCRIPTION | VARCHAR | Business description |
-
-### FACTS
-
-| Column | Type | Purpose |
-|---|---|---|
-| MODEL_NAME | VARCHAR | FK → MODELS |
-| FACT_NAME | VARCHAR | Business name |
-| PHYSICAL_TABLE | VARCHAR | Underlying FACT table |
-| GRAIN_DESCRIPTION | VARCHAR | What one row represents |
-
-### MEASURES
-
-| Column | Type | Purpose |
-|---|---|---|
-| MODEL_NAME | VARCHAR | FK → MODELS |
-| FACT_NAME | VARCHAR | FK → FACTS within model |
-| MEASURE_NAME | VARCHAR | Business name (e.g., "Total Revenue") |
-| EXPRESSION | VARCHAR | SQL expression — typically an aggregate |
-| AGGREGATION | VARCHAR | SUM / AVG / COUNT / MIN / MAX / NONE |
-| FORMAT_HINT | VARCHAR | currency_usd / percent / integer / etc. |
-| DESCRIPTION | VARCHAR | Business description |
-
-### RELATIONSHIPS
-
-| Column | Type | Purpose |
-|---|---|---|
-| MODEL_NAME | VARCHAR | FK → MODELS |
-| RELATIONSHIP_NAME | VARCHAR | Business name (e.g., "ordered_by", "shipped_to") |
-| FACT_NAME | VARCHAR | One side |
-| DIM_NAME | VARCHAR | Other side |
-| FACT_FK_COLUMN | VARCHAR | Physical join column on fact |
-| DIM_PK_COLUMN | VARCHAR | Physical join column on dim |
-| ROLE_PLAYING_AS | VARCHAR | Null for normal joins; non-null for role-playing dates ("order_date", "ship_date") |
-
-## SQLCUBE.ADAPTER UDF
-
-The query rewrite engine. Implements the Exasol Virtual Schema adapter contract:
-
-- `set_capabilities` — declares which SQL operators the adapter can push down (selects, projects, aggregates, joins between mounted tables)
-- `refresh` — rebuilds the virtual catalog from SQLCUBE_META; called by `REFRESH VIRTUAL SCHEMA`
-- `drop_virtual_schema` — cleanup
-
-At query time, the adapter walks the parse tree from Exasol, maps virtual identifiers to physical identifiers via SQLCUBE_META, expands measures via their EXPRESSION column, and emits the rewritten SQL back to Exasol's optimizer.
-
-Source lives in `exasol-factory-foundation/sqlcube/adapter/` (Lua UDF). Not in this skill's scope to modify — agents should treat the adapter as a black box and only manipulate SQLCUBE_META.
-
-## When the ADAPTER is missing
-
-If `SELECT * FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA = 'SQLCUBE' AND SCRIPT_NAME = 'ADAPTER'` returns 0 rows, the infrastructure isn't installed. The exanano-sqlcube container ships it pre-installed; other Exasol clusters need a one-time install. Defer to `references/install.md` (and the `sqlcube` repo's deployment scripts).
+**Q: Why is the registry schema name configurable?**
+A: `settings.exa_registry_schema` defaults to `SQLCUBE_REGISTRY`, but the studio team may rename it in a future release. The skill parameter `registry_schema` mirrors that knob. Today it must match what the adapter was deployed with — overriding both in lockstep is currently a manual operation (see `troubleshooting.md` §1).
 
 ## Mental model
 
-Treat SQLCUBE_META as the source-of-truth and the virtual schema as a computed view of it. Every operation in this skill is:
+```
+Adapter is stateless. Registry holds the cube. Virtual schema is the UI.
+```
 
-1. INSERT / UPDATE rows into SQLCUBE_META
-2. Run `CREATE VIRTUAL SCHEMA ... USING SQLCUBE.ADAPTER` (or `REFRESH VIRTUAL SCHEMA`) so the adapter picks up the changes
+Every operation in this skill is either:
 
-That's the loop. Everything else is detail.
+1. Sanitize identifiers + decide the layer / model / domain ids
+2. INSERT rows into SQLCUBE_REGISTRY (after DELETE for upsert)
+3. Run `CREATE OR REPLACE VIRTUAL SCHEMA SQLCUBE_<LAYER>` so analysts see the result
+4. Verify a SELECT round-trip works
+
+Most failures are at step 4 and trace back to (a) JOINS rows pointing at columns that don't exist, (b) MEASURES expressions that reference an alias the JOINS didn't define, (c) DIMENSIONS rows whose DIM_TABLE_ALIAS doesn't have a matching JOINS entry.

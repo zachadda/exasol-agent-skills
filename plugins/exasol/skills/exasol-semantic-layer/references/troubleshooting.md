@@ -1,277 +1,352 @@
 # Troubleshooting cubes
 
-Failure modes during creation, refresh, and query against a SQLCube virtual schema. Ordered by what the agent will likely encounter first.
+Failure modes during creation, registry upsert, and query against a SQLCube virtual schema. Ordered by what the agent will likely encounter first.
+
+Schema name convention in this doc: registry = `SQLCUBE_REGISTRY` (override if customized); virtual schema = `SQLCUBE_<LAYER_ID>`.
 
 ## Decision tree
 
 ```
-CREATE VIRTUAL SCHEMA fails              → §1
-REFRESH VIRTUAL SCHEMA fails             → §2
-SELECT * FROM cube.X works, but…
-  …a measure errors                      → §3
-  …a join returns no rows / cross-product → §4
-  …role-playing date returns garbage     → §5
-LLM enrichment produces nonsense          → §6
-MCP doesn't see the cube                  → §7
+CREATE VIRTUAL SCHEMA fails                          → §1
+Registry upsert fails                                → §2
+SELECT * FROM cube works, but…
+  …a measure errors                                  → §3
+  …a join returns cross-product / wrong row count    → §4
+  …role-playing dim returns garbage                  → §5
+LLM enrichment produces invalid rows                  → §6
+MCP / list_schemas doesn't see the cube              → §7
+Identifier casing errors at query time                → §8
 ```
 
 ## §1 CREATE VIRTUAL SCHEMA fails
 
-Most common cold-start errors and their causes.
+### "Script SQLCUBE.ADAPTER not found"
 
-### "Model not registered: <CUBE_NAME>"
+**Cause:** Adapter not installed.
 
-**Cause:** SQLCUBE_META.MODELS row not inserted before the CREATE statement.
+**Fix:** Route to `install.md`. Don't try to fall back.
 
-**Fix:** INSERT the MODELS row first. The adapter's `set_capabilities` callback runs on CREATE and reads MODELS to bootstrap; without it there's nothing to mount.
+### "Property MODEL_ID is required" or "LAYER_ID / MODEL_IDS not set"
 
-### "Source schema not found: <SOURCE_SCHEMA>"
+**Cause:** WITH clause shape doesn't match what the adapter expects. The adapter accepts either:
 
-**Cause:** Either the schema doesn't exist, or `MODELS.SOURCE_SCHEMA` value doesn't match what was passed in the CREATE WITH clause.
+```
+MODEL_ID = '<id>'                     # single-model legacy
+```
+
+OR
+
+```
+LAYER_ID = '<id>' MODEL_IDS = '<csv>' # multi-domain
+```
+
+**Fix:** Pick a mode. The skill's `mode` parameter (`multi_domain` default, `single_model` legacy) controls which shape lands. If you mixed both (e.g., supplied MODEL_IDS but the adapter version pre-dates multi-domain), upgrade the adapter or drop to single-model.
+
+### "MODELS row not found for MODEL_ID 'x'"
+
+**Cause:** Registry MODELS row absent when CREATE VIRTUAL SCHEMA runs. Adapter validates referenced model_ids at `set_capabilities`.
+
+**Fix:** Insert MODELS row first. Registry write order matters — see `cube-creation.md`.
+
+### "Schema SQLCUBE_<LAYER> already exists"
+
+**Cause:** Previous deploy left a virtual schema; CREATE without DROP fails.
+
+**Fix:** Skill should always emit `DROP VIRTUAL SCHEMA IF EXISTS "<NAME>" CASCADE;` before CREATE. If running manually:
+
+```sql
+DROP VIRTUAL SCHEMA IF EXISTS "SQLCUBE_ADVENTUREWORKS" CASCADE;
+```
+
+CASCADE drops dependent objects (none should exist, but be safe).
+
+### Adapter fails silently during CREATE — no error, but virtual schema has zero tables
+
+**Cause:** Adapter's `set_capabilities` short-circuited due to bad registry data. Most common: MODEL_IDS in the WITH clause references model_ids that don't exist in MODELS table.
 
 **Fix:**
+
 ```sql
-SELECT * FROM SYS.EXA_ALL_SCHEMAS WHERE SCHEMA_NAME = '<SOURCE_SCHEMA>';
-SELECT SOURCE_SCHEMA FROM SQLCUBE_META.MODELS WHERE MODEL_NAME = '<CUBE_NAME>';
+-- Confirm MODELS rows exist for each id in the WITH clause:
+SELECT MODEL_ID FROM SQLCUBE_REGISTRY.MODELS
+WHERE MODEL_ID IN ('factinternetsales', 'factresellersales');
+
+-- Confirm the virtual schema landed:
+SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = 'SQLCUBE_ADVENTUREWORKS';
 ```
 
-If schema missing → migrate hasn't run, or it ran to a different target. If values disagree → UPDATE MODELS row before retry.
+If MODELS missing → fix registry. If MODELS present but virtual schema has zero tables → the adapter logs to Exasol's auditing system; check `SELECT * FROM SYS.EXA_STATISTICS_SESSION` or your DBA's adapter log destination.
 
-### "Dimension table not found: DIM_X"
+## §2 Registry upsert fails
 
-**Cause:** SQLCUBE_META.DIMENSIONS references a `PHYSICAL_TABLE` that doesn't exist in `SOURCE_SCHEMA`. Often: typo in INSERT, or table was DROPped between META writes and CREATE.
+### "Object SQLCUBE_REGISTRY.MODELS not found"
+
+**Cause:** Registry schema or tables missing.
+
+**Fix:** Route to `install.md`. The skill's precondition check should have caught this; if it didn't, the agent may have been pointed at the wrong cluster.
+
+### "Cannot delete row: foreign key constraint violated"
+
+**Cause:** Wrong DELETE order. SQLCUBE_REGISTRY has FK constraints (MODELS → DOMAINS, DIMENSIONS/MEASURES/JOINS → MODELS). DELETE must happen child-first.
+
+**Fix:** Use the canonical order from `meta-model.md`:
+
+```
+DERIVED_MEASURES, JOINS, MEASURES, DIMENSIONS, MODELS, JOIN_PATHS, ATTRIBUTES, DOMAINS
+```
+
+If you're getting this error, the skill emitted DELETEs in the wrong order. Inspect the generated SQL.
+
+### "Cannot insert: duplicate key on (MODEL_ID, VIRTUAL_COL)"
+
+**Cause:** DIMENSIONS or MEASURES has a duplicate row from a prior incomplete deploy.
+
+**Fix:** Re-run the full upsert. DELETE-by-domain_id should clear the duplicates. If a single domain owns rows that overlap with another domain's slug, that's a deeper data-integrity issue — investigate which deploys ran historically.
+
+### "Object MODEL_ID does not exist" during INSERT
+
+**Cause:** Inserting DIMENSIONS / MEASURES / JOINS before the parent MODELS row exists.
+
+**Fix:** Order matters in INSERT too: DOMAINS → ATTRIBUTES → JOIN_PATHS → MODELS → DIMENSIONS → MEASURES → DERIVED_MEASURES → JOINS.
+
+## §3 Measure error at query time
+
+### "Column UNITPRICE not found"
+
+**Cause:** `PHYSICAL_EXPR` references a column the underlying fact table doesn't have. Common after a column rename in the source schema.
 
 **Fix:**
+
 ```sql
-SELECT DIM_NAME, PHYSICAL_TABLE FROM SQLCUBE_META.DIMENSIONS WHERE MODEL_NAME='<CUBE_NAME>';
-SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA='<SOURCE_SCHEMA>';
+-- Verify each measure expression dry-runs:
+SELECT MEASURE_ID, VIRTUAL_COL, PHYSICAL_EXPR
+FROM SQLCUBE_REGISTRY.MEASURES
+WHERE MODEL_ID = 'factinternetsales';
 ```
 
-Reconcile and re-INSERT.
+For each, run:
 
-### "Primary key column not found: <PK_COLUMN> on <DIM_TABLE>"
-
-**Cause:** DIMENSIONS.PK_COLUMN refers to a column that doesn't exist on the table. Often: optimize discovered the wrong PK, or someone manually edited DIMENSIONS.
-
-**Fix:** Verify against the constraints catalog:
 ```sql
-SELECT COLUMN_NAME
-FROM SYS.EXA_ALL_CONSTRAINT_COLUMNS
-WHERE CONSTRAINT_SCHEMA='<SOURCE_SCHEMA>'
-  AND CONSTRAINT_TABLE='<DIM_TABLE>'
-  AND CONSTRAINT_TYPE='PRIMARY KEY';
+SELECT <PHYSICAL_EXPR> FROM <FACT_SCHEMA>.<FACT_TABLE> f LIMIT 0;
 ```
 
-If 0 rows → PK was never declared (re-run exasol-optimize or ALTER TABLE manually). Fix the PK_COLUMN value, retry.
+Anything that errors → update or DELETE the measure row, re-run.
 
-### "Adapter UDF not callable: SQLCUBE.ADAPTER"
+### "Function SUM cannot be applied to type VARCHAR"
 
-**Cause:** Either the UDF isn't installed (precondition `sqlcube_installed` failed), or its language container isn't loaded.
+**Cause:** `AGG_TYPE='SUM'` on a non-numeric expression.
 
 **Fix:**
-```sql
-SELECT * FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_NAME='ADAPTER' AND SCRIPT_SCHEMA='SQLCUBE';
-```
-
-If empty → install via `references/install.md` (or factory-foundation's deployment script).
-
-If present but errors at call time → check Exasol's UDF runtime: probably out of memory or the Lua container is corrupt. `docker restart exanano-sqlcube` and retry.
-
-## §2 REFRESH VIRTUAL SCHEMA fails
-
-`REFRESH VIRTUAL SCHEMA <CUBE_NAME>` rebuilds the adapter's internal catalog. Failures here are typically:
-
-### Newly-added measure references a column that doesn't exist
-
-**Cause:** SQLCUBE_META.MEASURES.EXPRESSION points at a column not on the fact (or referenced dimension).
-
-**Fix:** Manual validation query:
-```sql
--- Approximate: list measures and check expressions actually parse
-SELECT FACT_NAME, MEASURE_NAME, EXPRESSION
-FROM SQLCUBE_META.MEASURES
-WHERE MODEL_NAME='<CUBE_NAME>';
-```
-
-For each, try:
-```sql
-SELECT <EXPRESSION> FROM <SOURCE_SCHEMA>.<PHYSICAL_FACT> LIMIT 0;
-```
-
-Any expression that errors → broken. DELETE the row from MEASURES, REFRESH again.
-
-### Newly-added relationship has incompatible PK/FK types
-
-**Cause:** `FACT_FK_COLUMN` and `DIM_PK_COLUMN` exist but their data types don't match (e.g., VARCHAR vs DECIMAL after a type narrowing run).
-
-**Fix:** Cast in the source data or restore the type via optimize re-run. Adapter won't auto-cast — joins on mismatched types are silently wrong.
 
 ```sql
-SELECT
-  (SELECT DATA_TYPE FROM SYS.EXA_ALL_COLUMNS
-   WHERE COLUMN_TABLE='<FACT>' AND COLUMN_NAME='<FK>') AS fk_type,
-  (SELECT DATA_TYPE FROM SYS.EXA_ALL_COLUMNS
-   WHERE COLUMN_TABLE='<DIM>' AND COLUMN_NAME='<PK>') AS pk_type;
+UPDATE SQLCUBE_REGISTRY.MEASURES
+SET AGG_TYPE = 'COUNT_DISTINCT'   -- or COUNT, or change PHYSICAL_EXPR
+WHERE MODEL_ID = '<m>' AND VIRTUAL_COL = '<col>';
 ```
 
-## §3 Query against cube errors on a measure
+### "Division by zero"
 
-### "Function SUM does not exist for column X" — or similar parse errors
+**Cause:** Ratio measure without NULLIF defense.
 
-**Cause:** Measure EXPRESSION is non-numeric (SUM on VARCHAR), or AGGREGATION doesn't match expression shape.
+**Fix:** Update the expression:
 
-**Fix:** Inspect:
 ```sql
-SELECT MEASURE_NAME, EXPRESSION, AGGREGATION
-FROM SQLCUBE_META.MEASURES
-WHERE MODEL_NAME='<CUBE_NAME>' AND FACT_NAME='<FACT>' AND MEASURE_NAME='<NAME>';
+UPDATE SQLCUBE_REGISTRY.MEASURES
+SET PHYSICAL_EXPR = '(f.MARGIN) / NULLIF(f.REVENUE, 0)'
+WHERE MODEL_ID = '<m>' AND VIRTUAL_COL = 'Margin Rate';
 ```
 
-If `AGGREGATION='SUM'` and the EXPRESSION is `CONCAT(FIRST_NAME, LAST_NAME)` → broken. Update or DELETE the row, REFRESH.
+### "Reference to alias 'f' is ambiguous"
 
-### Divide-by-zero in measure
-
-**Cause:** Expression is a ratio without NULLIF / ZEROIFNULL defense.
-
-**Fix:** UPDATE EXPRESSION to wrap the divisor:
-```sql
-UPDATE SQLCUBE_META.MEASURES
-SET EXPRESSION = '(REVENUE - COST) / NULLIF(REVENUE, 0)'
-WHERE MODEL_NAME='<CUBE_NAME>' AND MEASURE_NAME='Margin Rate';
-```
-
-Then REFRESH.
-
-## §4 Joins produce wrong rows
-
-### Cross-product (NxM rows where you expected N)
-
-**Cause:** RELATIONSHIPS row missing or `FACT_FK_COLUMN` / `DIM_PK_COLUMN` swapped.
-
-**Fix:** Check the relationships graph for the cube:
-```sql
-SELECT RELATIONSHIP_NAME, FACT_NAME, DIM_NAME, FACT_FK_COLUMN, DIM_PK_COLUMN, ROLE_PLAYING_AS
-FROM SQLCUBE_META.RELATIONSHIPS
-WHERE MODEL_NAME='<CUBE_NAME>'
-ORDER BY FACT_NAME, DIM_NAME;
-```
-
-Compare against the optimize-discovered FK graph:
-```sql
-SELECT CONSTRAINT_TABLE AS fact, CONSTRAINT_COLUMN AS fk_col,
-       REFERENCED_TABLE AS dim, REFERENCED_COLUMN AS pk_col
-FROM SYS.EXA_ALL_CONSTRAINT_COLUMNS
-WHERE CONSTRAINT_TYPE='FOREIGN KEY' AND CONSTRAINT_SCHEMA='<SOURCE_SCHEMA>';
-```
-
-If a known FK doesn't appear in RELATIONSHIPS → INSERT it and REFRESH.
-
-### Zero rows when you expected some
-
-**Cause:** Join column values don't actually overlap (e.g., FK was declared but data was loaded with empty/null values). Or the IS_HIDDEN flag is masking the rows.
-
-**Fix:** Check raw overlap:
-```sql
-SELECT COUNT(*) FROM <SOURCE>.<FACT>
-WHERE <FK_COL> IN (SELECT <PK_COL> FROM <SOURCE>.<DIM>);
-```
-
-If 0 → data problem, not cube problem. Defer to migrate / optimize logs.
-
-## §5 Role-playing date returns garbage
-
-### Both roles return the same data
-
-**Cause:** RELATIONSHIPS has two rows pointing at DIM_DATE but `ROLE_PLAYING_AS` is null on one or both. Adapter can't disambiguate, picks first match.
+**Cause:** The expression uses an alias the adapter didn't expect to generate. The adapter generates `FROM <FACT_SCHEMA>.<FACT_TABLE> f` — measures must use `f.` for fact columns. Using `<TABLE_NAME>.<COL>` instead also fails.
 
 **Fix:**
-```sql
-SELECT RELATIONSHIP_NAME, FACT_FK_COLUMN, DIM_PK_COLUMN, ROLE_PLAYING_AS
-FROM SQLCUBE_META.RELATIONSHIPS
-WHERE MODEL_NAME='<CUBE_NAME>' AND DIM_NAME='Date';
-```
-
-Each row should have a distinct `ROLE_PLAYING_AS` (`OrderDate`, `ShipDate`, etc.). If null → UPDATE:
-```sql
-UPDATE SQLCUBE_META.RELATIONSHIPS
-SET ROLE_PLAYING_AS = 'OrderDate'
-WHERE MODEL_NAME='<CUBE_NAME>' AND RELATIONSHIP_NAME='Order Date';
-```
-
-REFRESH after.
-
-### Query references `OrderDate.Year` but adapter errors
-
-**Cause:** Adapter is matching on RELATIONSHIP_NAME instead of ROLE_PLAYING_AS in some versions. Workaround: align the two.
 
 ```sql
-UPDATE SQLCUBE_META.RELATIONSHIPS
-SET RELATIONSHIP_NAME = ROLE_PLAYING_AS
-WHERE MODEL_NAME='<CUBE_NAME>' AND ROLE_PLAYING_AS IS NOT NULL;
+UPDATE SQLCUBE_REGISTRY.MEASURES
+SET PHYSICAL_EXPR = 'f.EXTENDEDAMOUNT'    -- not FACTINTERNETSALES.EXTENDEDAMOUNT
+WHERE MODEL_ID = '<m>' AND VIRTUAL_COL = '<col>';
 ```
 
-REFRESH. Then query `OrderDate.Year` should resolve.
+## §4 Wrong row counts
 
-## §6 LLM enrichment produces nonsense
+### Cross-product (NxM rows when N expected)
+
+**Cause:** A DIMENSIONS row references a DIM_TABLE_ALIAS that doesn't have a matching JOINS row. The adapter doesn't know how to bring the dim in, and depending on adapter version either joins on nothing (Cartesian) or returns nulls.
+
+**Fix:**
+
+```sql
+-- Find DIMENSIONS rows missing a JOINS counterpart:
+SELECT D.MODEL_ID, D.VIRTUAL_COL, D.PHYSICAL_TABLE, D.DIM_TABLE_ALIAS
+FROM SQLCUBE_REGISTRY.DIMENSIONS D
+LEFT JOIN SQLCUBE_REGISTRY.JOINS J
+  ON D.MODEL_ID = J.MODEL_ID AND D.DIM_TABLE_ALIAS = J.DIM_ALIAS
+WHERE J.JOIN_ID IS NULL
+  AND D.IS_VISIBLE
+ORDER BY D.MODEL_ID, D.VIRTUAL_COL;
+```
+
+Anything returned → add a JOINS row, or fix the DIM_TABLE_ALIAS, or hide the DIMENSIONS row (`IS_VISIBLE=FALSE`).
+
+### Zero rows when some expected
+
+**Cause:** `JOIN_TYPE='INNER'` on a JOINS row, and the join key doesn't match in the data.
+
+**Fix:**
+
+```sql
+-- Sanity-check the join keys overlap:
+SELECT COUNT(*) FROM <FACT> f
+WHERE f.<FACT_FK> IN (SELECT <DIM_KEY> FROM <DIM>);
+```
+
+If zero → data problem upstream. If non-zero but query returns zero → JOIN_TYPE='INNER' is dropping rows you wanted; switch to LEFT:
+
+```sql
+UPDATE SQLCUBE_REGISTRY.JOINS
+SET JOIN_TYPE = 'LEFT'
+WHERE MODEL_ID = '<m>' AND JOIN_ID = <id>;
+```
+
+## §5 Role-playing dim returns garbage
+
+### Both date roles return the same data
+
+**Cause:** Two DIMENSIONS rows for the same dim column with the same `DIM_TABLE_ALIAS`. Adapter picks one and ignores the other.
+
+**Fix:**
+
+```sql
+SELECT MODEL_ID, VIRTUAL_COL, PHYSICAL_TABLE, PHYSICAL_COL, DIM_TABLE_ALIAS
+FROM SQLCUBE_REGISTRY.DIMENSIONS
+WHERE MODEL_ID = '<m>' AND PHYSICAL_TABLE = 'ADVENTUREWORKS.DIMDATE';
+```
+
+Each role must have a distinct DIM_TABLE_ALIAS. Fix by updating the rows or re-running the structural pass with the role-playing detection enabled.
+
+### "Cannot resolve column dim2.CALENDARYEAR"
+
+**Cause:** DIMENSIONS row references `DIM_TABLE_ALIAS='dim2'` but there's no JOINS row with `DIM_ALIAS='dim2'` for that model.
+
+**Fix:** Add the JOINS row. Pattern for an order-date join:
+
+```sql
+INSERT INTO SQLCUBE_REGISTRY.JOINS
+  (JOIN_ID, MODEL_ID, DIM_TABLE, DIM_ALIAS, DIM_KEY, FACT_FK, JOIN_TYPE, JOIN_ORDER)
+VALUES (
+  <next_id>, '<MODEL>',
+  'ADVENTUREWORKS.DIMDATE', 'dim2', 'DATEKEY', 'ORDERDATEKEY', 'LEFT', 30
+);
+```
+
+## §6 LLM enrichment produces invalid rows
 
 ### Hallucinated columns / tables
 
-**Cause:** LLM cherry-picked names that "should exist" but don't. Validation should have caught this — see `llm-enrichment.md` §Validation.
+**Cause:** LLM proposed a PHYSICAL_TABLE / PHYSICAL_COL that doesn't exist. Should have been caught by validation in `llm-enrichment.md`, but if it wasn't:
 
-**Fix:** If validation didn't run, run it now:
 ```sql
-SELECT m.MEASURE_NAME, m.EXPRESSION
-FROM SQLCUBE_META.MEASURES m
-WHERE m.MODEL_NAME='<CUBE_NAME>';
+-- Find DIMENSIONS pointing at nonexistent physical columns:
+SELECT D.MODEL_ID, D.VIRTUAL_COL, D.PHYSICAL_TABLE, D.PHYSICAL_COL
+FROM SQLCUBE_REGISTRY.DIMENSIONS D
+LEFT JOIN SYS.EXA_ALL_COLUMNS C
+  ON UPPER(D.PHYSICAL_TABLE) = C.COLUMN_SCHEMA || '.' || C.COLUMN_TABLE
+ AND UPPER(D.PHYSICAL_COL) = C.COLUMN_NAME
+WHERE C.COLUMN_NAME IS NULL;
 ```
 
-For each EXPRESSION, dry-run:
-```sql
-SELECT <EXPRESSION> FROM <SOURCE>.<FACT> LIMIT 0;
-```
+Anything returned → DELETE those rows, re-run validation.
 
-DELETE rows that error.
+### Wrong-domain naming
 
-### Wrong-domain naming (LLM thinks it's a different schema)
+LLM saw schema `ORDERS` and assumed e-commerce when it's actually logistics shipments. The cube technically works, but business labels are misleading.
 
-**Cause:** Domain hint absent or misleading. LLM saw `ORDERS` table and assumed e-commerce when it's a logistics shipment table.
-
-**Fix:** Easiest path — disable enrichment for now (`llm_enrichment=false`), generate the cube structurally, hand-write a `dimensions_overrides` YAML, re-run with overrides.
-
-Don't try to tune the LLM prompt for a single use case. Lock in via YAML.
+**Fix:** Set `llm_enrichment=false`, supply a `dimensions_overrides.yaml` with correct domain labels, re-run.
 
 ## §7 MCP doesn't see the cube
 
-### `mcp__exasol_db__list_exasol_schemas` doesn't list the cube
+### `mcp__exasol_db__list_exasol_schemas` doesn't list it
 
-**Cause:** MCP server caches the schema list. Hot-reload not triggered, or MCP server config doesn't include SQLCUBE virtual schemas.
+**Cause:** MCP server caches the schema list, or filters virtual schemas.
 
 **Fix:**
-1. Verify with direct SQL: `SELECT 1 FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME='<CUBE>'`. If 0 → cube doesn't actually exist, look at §1.
-2. If cube exists → MCP server needs reload. For exanano-sqlcube's bundled MCP: `docker exec exanano-sqlcube sv reload mcp` (or restart container).
-3. Check MCP config: `~/.config/claude/mcp_servers.json` (or wherever) — the `exasol_db` entry should NOT filter out virtual schemas. If it does (some configs use `schema_filter: physical_only`), remove the filter.
 
-### MCP sees the cube but queries return "schema not found"
+1. Confirm SQL-side: `SELECT 1 FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'SQLCUBE_<LAYER>'`. If 0, cube doesn't actually exist; see §1.
+2. Reload MCP. For exanano-sqlcube's bundled MCP, `docker exec exanano-sqlcube sv reload mcp` (or container restart).
+3. Check MCP config — `~/.config/claude/mcp_servers.json` or platform-equivalent. Some configs filter virtual schemas via `schema_filter` — remove or extend.
 
-**Cause:** Caching mismatch — MCP fetched a schema list before cube creation, then a query referenced it.
+### MCP sees the cube but query errors with "schema not found"
 
-**Fix:** Re-trigger schema discovery. In most clients: send `mcp__exasol_db__list_exasol_schemas` once, then the query.
+**Cause:** MCP fetched the schema list before the cube existed.
 
-## Total bricking
+**Fix:** Re-list schemas (`mcp__exasol_db__list_exasol_schemas`), then re-issue the query.
 
-If multiple cubes are dysfunctional after a complex sequence of changes:
+## §8 Identifier casing errors
+
+### "Object SQLCUBE_ADVENTUREWORKS.FACTINTERNETSALES does not exist"
+
+**Cause:** Unquoted reference to the virtual table — Exasol uppercased `factinternetsales` to `FACTINTERNETSALES`, which doesn't match.
+
+**Fix:** Always quote:
 
 ```sql
--- Wipe just this cube:
-DROP VIRTUAL SCHEMA <CUBE_NAME> CASCADE;
-DELETE FROM SQLCUBE_META.RELATIONSHIPS WHERE MODEL_NAME='<CUBE_NAME>';
-DELETE FROM SQLCUBE_META.MEASURES      WHERE MODEL_NAME='<CUBE_NAME>';
-DELETE FROM SQLCUBE_META.COLUMNS       WHERE MODEL_NAME='<CUBE_NAME>';
-DELETE FROM SQLCUBE_META.FACTS         WHERE MODEL_NAME='<CUBE_NAME>';
-DELETE FROM SQLCUBE_META.DIMENSIONS    WHERE MODEL_NAME='<CUBE_NAME>';
-DELETE FROM SQLCUBE_META.MODELS        WHERE MODEL_NAME='<CUBE_NAME>';
+SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales" LIMIT 1;
 ```
 
-Then re-run `exasol-semantic-layer` from scratch. The source schema isn't touched.
+### "Object SQLCUBE_ADVENTUREWORKS.factinternetsales does not exist" (even with quotes)
 
-Never blanket-wipe SQLCUBE_META across cubes — other cubes share the schema and will break.
+**Cause:** The MODEL_IDS WITH-clause property didn't include this model. Multi-domain mode only mounts the models listed in MODEL_IDS.
+
+**Fix:**
+
+```sql
+-- See what's mounted:
+SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = 'SQLCUBE_ADVENTUREWORKS';
+
+-- Re-create with the right MODEL_IDS:
+DROP VIRTUAL SCHEMA "SQLCUBE_ADVENTUREWORKS" CASCADE;
+CREATE VIRTUAL SCHEMA "SQLCUBE_ADVENTUREWORKS" USING SQLCUBE.ADAPTER
+  WITH IS_LOCAL='true' LAYER_ID='ADVENTUREWORKS'
+       MODEL_IDS='factinternetsales,factresellersales';
+```
+
+### "Column 'Extended Amount' not found"
+
+**Cause:** Unquoted column name with a space → Exasol parse error or wrong identifier resolution.
+
+**Fix:**
+
+```sql
+SELECT "Extended Amount" FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales";
+```
+
+## Total wipe and rebuild
+
+If a cube is fundamentally broken and the user accepts wiping its registry rows:
+
+```sql
+DROP VIRTUAL SCHEMA IF EXISTS "SQLCUBE_<LAYER>" CASCADE;
+
+-- Per domain — repeat for each:
+DELETE FROM SQLCUBE_REGISTRY.DERIVED_MEASURES WHERE MODEL_ID IN (SELECT MODEL_ID FROM SQLCUBE_REGISTRY.MODELS WHERE DOMAIN_ID = '<DOM>');
+DELETE FROM SQLCUBE_REGISTRY.JOINS            WHERE MODEL_ID IN (SELECT MODEL_ID FROM SQLCUBE_REGISTRY.MODELS WHERE DOMAIN_ID = '<DOM>');
+DELETE FROM SQLCUBE_REGISTRY.MEASURES         WHERE MODEL_ID IN (SELECT MODEL_ID FROM SQLCUBE_REGISTRY.MODELS WHERE DOMAIN_ID = '<DOM>');
+DELETE FROM SQLCUBE_REGISTRY.DIMENSIONS       WHERE MODEL_ID IN (SELECT MODEL_ID FROM SQLCUBE_REGISTRY.MODELS WHERE DOMAIN_ID = '<DOM>');
+DELETE FROM SQLCUBE_REGISTRY.MODELS           WHERE DOMAIN_ID = '<DOM>';
+DELETE FROM SQLCUBE_REGISTRY.JOIN_PATHS       WHERE DOMAIN_ID = '<DOM>';
+DELETE FROM SQLCUBE_REGISTRY.ATTRIBUTES       WHERE DOMAIN_ID = '<DOM>';
+DELETE FROM SQLCUBE_REGISTRY.DOMAINS          WHERE DOMAIN_ID = '<DOM>';
+```
+
+Then re-run the skill from scratch. The source schema isn't touched. Other domains in the same registry are untouched.
+
+NEVER blanket-wipe the entire SQLCUBE_REGISTRY — other cubes share it.
+
+## When to call DBA
+
+- Adapter UDF won't deploy (Lua compile / permissions). Get cluster privileges.
+- BucketFS upload fails (auth / bucket missing). Get bucket credentials.
+- Registry schema gets corrupted somehow (FKs out of sync). Restore from backup or `EXPORT SCHEMA` from a known-good environment and re-import.
+
+The adapter source lives in `exasol-factory-foundation/sqlcube/adapter/` — the studio team owns it. File issues against that repo, not this skill.

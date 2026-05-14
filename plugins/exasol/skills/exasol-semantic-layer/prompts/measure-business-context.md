@@ -87,12 +87,12 @@ Additional:
 
 ## Storage
 
-Approved measures go into SQLCUBE_META.MEASURES with the FACT_NAME = business name of the fact, MEASURE_NAME = LLM-provided name. Priority is logged separately (not in the canonical schema) for plan-presentation:
+Approved measures go into `SQLCUBE_REGISTRY.MEASURES` (one row per measure, keyed by `(MODEL_ID, VIRTUAL_COL)`). The LLM's `business_priority` field is not part of the registry schema — it's stored in a side log for downstream consumers:
 
 ```sql
--- Hidden side table for priority hints, only consumed by dashboard panel-planning
-INSERT INTO EXA_OPTIMIZE_LOG.MEASURE_PRIORITY (MODEL_NAME, FACT_NAME, MEASURE_NAME, BUSINESS_PRIORITY)
-VALUES (?, ?, ?, ?);
+-- Side table for priority hints, consumed by dashboard panel-planning
+INSERT INTO EXA_OPTIMIZE_LOG.MEASURE_PRIORITY (MODEL_ID, VIRTUAL_COL, BUSINESS_PRIORITY)
+VALUES (?, ?, ?);
 ```
 
 Downstream `exasol-dashboard` reads this when picking which measures to feature in KPI tiles.
