@@ -103,8 +103,8 @@ For a fresh ADVENTUREWORKS environment via `/oneshot-tour`: the migrate + optimi
 1. Verify data source       (cube preferred; raw schema acceptable)
 2. Plan panel inventory     (LLM-driven from cube metadata, or read YAML)
 3. For each panel:
-   a. Compose SQL           (against cube or raw schema)
-   b. Execute               (via exapump or pyexasol)
+   a. Compose SQL           (against cube or raw schema; cube queries: implicit GROUP BY, see exasol-semantic-layer/references/query-patterns.md)
+   b. Execute               (POST /api/query/execute when studio reachable; fallback: exapump or pyexasol)
    c. Cap result            (5000 rows max; LIMIT or aggregate-down)
    d. Pick chart type       (chart-selection.md rules)
    e. Generate Vega-Lite    (templates + data)

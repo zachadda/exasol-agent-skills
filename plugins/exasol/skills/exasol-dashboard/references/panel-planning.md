@@ -8,14 +8,17 @@ Used when the user hasn't supplied a panels YAML. Default for `/oneshot-tour` an
 
 ### Inputs
 
-For a SQLCube source:
+For a SQLCube source — read from `SQLCUBE_REGISTRY` (the cube definition schema, **not** `SQLCUBE_META` which is studio app state + lineage):
 
-- `SQLCUBE_META.MODELS.DESCRIPTION` for the cube
-- All `DIMENSIONS` rows (name, description, key columns)
-- All `FACTS` rows (name, grain)
-- All `MEASURES` rows (name, expression, aggregation, format)
-- All `RELATIONSHIPS` rows
-- (Optional) Sample rows: `SELECT * FROM <cube>.<fact> LIMIT 20` for context
+- `SQLCUBE_REGISTRY.DOMAINS` (`DOMAIN_ID`, `DOMAIN_NAME`, `DESCRIPTION`) — business grouping above models
+- `SQLCUBE_REGISTRY.MODELS` (`MODEL_ID`, `MODEL_LABEL`, `FACT_SCHEMA`, `FACT_TABLE`) — one row per fact-table grain. `MODEL_ID` is the lowercase virtual-table name and **equals `DOMAIN_ID` in this codebase** (deployer.py assigns them in lockstep).
+- `SQLCUBE_REGISTRY.DIMENSIONS` (`MODEL_ID`, `VIRTUAL_COL`, `PHYSICAL_TABLE`, `PHYSICAL_COL`, `DIM_TABLE_ALIAS`, `IS_VISIBLE`) — column-level virtual surface. Filter `IS_VISIBLE = TRUE` to match what the adapter projects onto the virtual schema.
+- `SQLCUBE_REGISTRY.MEASURES` (`MODEL_ID`, `VIRTUAL_COL`, `AGG_TYPE`, `PHYSICAL_EXPR`, `FORMAT_MASK`, `IS_VISIBLE`) — aggregable virtual columns. `VIRTUAL_COL` is Title Case with spaces (`"Sales Amount"`, `"Order Count"`).
+- `SQLCUBE_REGISTRY.JOINS` (`MODEL_ID`, `DIM_TABLE`, `DIM_ALIAS`, `DIM_KEY`, `FACT_FK`, `JOIN_TYPE`, `JOIN_ORDER`) — physical join graph. `JOIN_TYPE` is auto-resolved to `INNER` for NOT NULL FKs, `LEFT` otherwise by `deployer._resolve_join_type()`.
+- `SQLCUBE_REGISTRY.ATTRIBUTES` (`DOMAIN_ID`, `BUSINESS_NAME`, `DISPLAY_TYPE`) — domain-level display labels useful for axis titles.
+- (Optional) Sample rows: `SELECT * FROM "<virtual_schema>"."<model_id>" LIMIT 20` (note both identifiers must be quoted; `model_id` is lowercase).
+
+See `exasol-semantic-layer/references/meta-model.md` for the full registry DDL + the schema-vs-app-state distinction.
 
 For a raw schema source:
 
