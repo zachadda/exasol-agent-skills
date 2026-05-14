@@ -15,10 +15,10 @@ CREATE VIRTUAL SCHEMA "SQLCUBE_ADVENTUREWORKS"
   WITH
     IS_LOCAL = 'true'
     LAYER_ID = 'ADVENTUREWORKS'
-    MODEL_IDS = 'factinternetsales,factresellersales,factinternetsales_by_month';
+    MODEL_IDS = 'internet_sales,reseller_sales,internet_sales_by_month';
 ```
 
-Each comma-separated id in `MODEL_IDS` becomes a virtual table inside the virtual schema. The adapter resolves each at query time by reading the registry's MODELS row.
+Each comma-separated id in `MODEL_IDS` becomes a virtual table inside the virtual schema (the studio deployer sets `MODEL_ID = DOMAIN_ID` — see `meta-model.md` conventions). The adapter resolves each at query time by reading the registry's MODELS row.
 
 ### Single-model (legacy, `mode=single_model`)
 
@@ -28,7 +28,7 @@ CREATE VIRTUAL SCHEMA "SQLCUBE_FACTINTERNETSALES"
   USING SQLCUBE.ADAPTER
   WITH
     IS_LOCAL = 'true'
-    MODEL_ID = 'factinternetsales';
+    MODEL_ID = 'internet_sales';
 ```
 
 Only the one model. Virtual schema is named after the model rather than the layer. Live `exanano-sqlcube` ships with several legacy schemas in this shape (`SQLCUBE_FACTINTERNETSALES`, `SQLCUBE_FACTINTERNETSALES_BY_MONTH`, etc.) — keep using `mode=single_model` when interacting with them.
@@ -68,33 +68,31 @@ The studio backend's `deployer.py:deploy()` runs this order. Agents following th
 
 4. Plan IDs
    - layer_id     = sanitize(source_schema)             # e.g., ADVENTUREWORKS
-   - domain_id    = lowercase(fact_table)               # default; LLM may rename
-   - model_id     = lowercase(fact_table)               # default; same as domain in 1-fact case
-   - dim_alias    = 'dim', 'dim1', 'dim2', ... assigned in JOIN_ORDER
+   - domain_id    = stable business slug (LLM-named, e.g. `internet_sales`)
+   - model_id     = **same string as domain_id** — `deployer.py:430` always writes `MODEL_ID = DOMAIN_ID`
+   - dim_alias    = first 3 alphanum lowercase chars of dim table + collision suffix (e.g. DIMPRODUCT → `dim`, DIMCUSTOMER → `dim1`, CALENDAR → `cal`)
    - virtual_schema = 'SQLCUBE_' + sanitize(layer_id)
 
-5. Generate registry rows (structural)
-   - DOMAINS:        one per fact
-   - MODELS:         one per fact
-   - DIMENSIONS:     for each FK-reachable dim, expose columns matching the classifier rules
-   - MEASURES:       one per numeric column on the fact (SUM default; see step 6 for overrides)
-   - JOINS:          one row per declared FK, ordered by FK column ordinal
-   - ATTRIBUTES:     one per visible dim column at domain level (mirror DIMENSIONS naming)
-   - JOIN_PATHS:     one per declared FK, mirror of JOINS
+5. Generate registry rows. **Structural defaults in this codebase come from `services/claude.py` LLM enrichment** — there is no deterministic per-numeric-column rule in the deployer. The LLM produces:
+   - DOMAINS:        one per fact / business grouping
+   - MODELS:         one per fact-table grain (MODEL_ID == DOMAIN_ID; GRAIN_KEY stays NULL)
+   - DIMENSIONS:     for each FK-reachable dim, exposed columns with VIRTUAL_COL in Title Case with spaces
+   - MEASURES:       proposed per numeric / amount column on the fact (SUM, COUNT_DISTINCT, AVG)
+   - JOINS:          one row per declared FK, alias derived from dim-table name
+   - ATTRIBUTES:     one per visible dim column at domain level (display labels)
+   - JOIN_PATHS:     one per declared FK, mirror of JOINS at domain level
 
-6. LLM enrichment (optional, when llm_enrichment=true)
-   - Add measure proposals
-   - Rename DIMENSIONS/ATTRIBUTES virtual_col to business-friendly names
-   - Set MODELS.MODEL_LABEL, MODELS.DOMAIN_ID display tweaks
-   - See `references/llm-enrichment.md`
+6. (Already inside step 5 — the LLM enrichment IS the structural pass in this codebase.) The patterns below ("Default measure derivation", "Default DIMENSIONS derivation") describe the **target shape** the LLM is prompted to produce, not deterministic code paths in `deployer.py`. Lock outputs with overrides if you need determinism.
 
 7. Merge user overrides
    - measures_overrides.yaml supplements / replaces measures by (model_id, virtual_col)
    - dimensions_overrides.yaml flips IS_VISIBLE, renames virtual_col, sets sort_order
 
-8. Upsert registry (per domain)
-   - DELETE in FK-correct order (DERIVED_MEASURES, JOINS, MEASURES, DIMENSIONS, MODELS, JOIN_PATHS, ATTRIBUTES, DOMAINS)
-   - INSERT in the opposite order (DOMAINS first, then attributes/join_paths, then MODELS, then per-model: DIMENSIONS, MEASURES, DERIVED_MEASURES, JOINS)
+8. Upsert registry (two-pass DELETE — live-verified from `deployer.py`)
+   - **First DELETE pass** (`_build_runtime_registry_sql` lines 400–412): purge by `(FACT_SCHEMA, FACT_TABLE)` pair to clear stale `MODEL_ID` slugs from earlier deploys (handles slug renames).
+   - **Second DELETE pass** (per domain): DERIVED_MEASURES → JOINS → MEASURES → DIMENSIONS → MODELS → JOIN_PATHS → ATTRIBUTES → DOMAINS.
+   - INSERT order in actual deployer: **DOMAINS → ATTRIBUTES → JOIN_PATHS → MODELS → JOINS → DIMENSIONS → MEASURES → DERIVED_MEASURES**. JOINS lands before DIMENSIONS in `_build_runtime_registry_sql` because DIMENSIONS rows reference alias values JOINS rows define.
+   - The registry has **no enforced FK constraints** in `build_registry_ddl`, so order is for human readability only — Exasol does not validate it.
 
 9. CREATE OR REPLACE VIRTUAL SCHEMA
    - DROP IF EXISTS first
@@ -105,9 +103,9 @@ The studio backend's `deployer.py:deploy()` runs this order. Agents following th
     - Three checks per SKILL.md
 ```
 
-## Default measure derivation
+## Default measure derivation (LLM-target shape, not deterministic code)
 
-When no LLM enrichment and no overrides, the structural pass produces a default measure per numeric column:
+The studio backend does NOT contain a deterministic per-numeric-column structural pass. The shape below is the **target** that `services/claude.py` is prompted to produce. Run with `llm_enrichment=true` (default) for the LLM to attempt it, or supply `measures_overrides.yaml` for full control.
 
 | Fact column type | Default measure |
 |---|---|
@@ -134,7 +132,7 @@ For each declared FK from FACT to DIM:
 1. Add a JOINS row with `DIM_ALIAS` = next available (`dim`, `dim1`, `dim2`, ...)
 2. For each non-PK column on the dim that survives the visibility filter:
    - Add a DIMENSIONS row tying `(MODEL_ID, virtual_col)` to `(PHYSICAL_TABLE=<DIM_TABLE_QUALIFIED>, PHYSICAL_COL=<col>, DIM_TABLE_ALIAS=<alias>)`
-   - `VIRTUAL_COL` defaults to title-case of `PHYSICAL_COL` (`FIRST_NAME` → `Firstname`)
+   - `VIRTUAL_COL` is Title Case with spaces in live registries (`FIRSTNAME` → `'First Name'`, `ENGLISHPRODUCTNAME` → `'English Product Name'`) — produced by LLM enrichment, not a code rule
    - `IS_VISIBLE` defaults TRUE except for known-noisy columns (audit fields, technical-key fields)
 
 Visibility filter rules:
@@ -155,9 +153,12 @@ A fact with two FKs to the same dim (e.g., `ORDERDATEKEY` and `SHIPDATEKEY` both
 
 ```
 JOINS:
-  (1, factinternetsales, ADVENTUREWORKS.DIMDATE, dim2, DATEKEY, ORDERDATEKEY, INNER, 30)
-  (2, factinternetsales, ADVENTUREWORKS.DIMDATE, dim3, DATEKEY, SHIPDATEKEY,  INNER, 31)
+  (1, internet_sales, ADVENTUREWORKS.DIMDATE, dim5, DATEKEY, ORDERDATEKEY, INNER, 70)
+  (2, internet_sales, ADVENTUREWORKS.DIMDATE, dim6, DATEKEY, SHIPDATEKEY,  INNER, 80)
+  (3, internet_sales, ADVENTUREWORKS.DIMDATE, dim7, DATEKEY, DUEDATEKEY,   INNER, 90)
 ```
+
+(Live aliases from `SQLCUBE_ADVENTUREWORKS.internet_sales` on `exanano-sqlcube` 2026-05-13 — the first DIMDATE join gets `dim5` because `dim/dim1/dim2/dim3/dim4` were taken by DIMPRODUCT-class tables earlier in JOIN_ORDER.)
 
 `JOIN_TYPE='INNER'` here because both date FKs are typically declared NOT NULL on the fact. See "Join type auto-resolution" below.
 
@@ -165,8 +166,8 @@ Then DIMENSIONS rows duplicate per role with role-prefixed `VIRTUAL_COL`:
 
 ```
 DIMENSIONS:
-  (..., factinternetsales, 'OrderDate Year',  'ADVENTUREWORKS.DIMDATE', 'CALENDARYEAR', 'dim2', ...)
-  (..., factinternetsales, 'ShipDate Year',   'ADVENTUREWORKS.DIMDATE', 'CALENDARYEAR', 'dim3', ...)
+  (..., internet_sales, 'OrderDate Year', 'ADVENTUREWORKS.DIMDATE', 'CALENDARYEAR', 'dim5', ...)
+  (..., internet_sales, 'ShipDate Year',  'ADVENTUREWORKS.DIMDATE', 'CALENDARYEAR', 'dim6', ...)
 ```
 
 The `OrderDate ` prefix is convention; the actual prefix comes from the LLM-derived or override-supplied role label.

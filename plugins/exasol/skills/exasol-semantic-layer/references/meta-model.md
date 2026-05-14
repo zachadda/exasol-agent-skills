@@ -4,6 +4,19 @@ Exact schema and population rules for the registry tables. Companion to `archite
 
 Canonical source: `factory-foundation/sqlcube/meta/01_create_tables.sql` and `factory-foundation/studio/backend/services/sqlcube_builder.py:build_registry_ddl()`. Treat those as ground truth; this file mirrors them.
 
+## Conventions established by the studio deployer (live-verified 2026-05-13)
+
+Before reading the per-table DDL: these conventions are not in the DDL — they're enforced by `studio/backend/services/deployer.py:_build_runtime_registry_sql()`. Surprised more than once when authoring by hand.
+
+| Convention | Reality | Implication |
+|---|---|---|
+| `MODELS.MODEL_ID` | **Always equals `DOMAIN_ID`** in this codebase (deployer line 430) | Don't invent a separate `factinternetsales` slug — use the same string for both |
+| `MODELS.GRAIN_KEY` | **Always NULL** (deployer line 431 hard-codes `NULL`) | The column exists in DDL but the studio deployer never populates it. Examples below show NULL. |
+| `DIMENSIONS.VIRTUAL_COL` | **Title Case with spaces** (`'English Product Name'`, `'First Name'`) — LLM-generated via `claude.py` enrichment | Don't compress to `'Englishproductname'`. SELECTs must quote spaces. |
+| Registry FK constraints | **Not enforced** — `build_registry_ddl` omits all `FOREIGN KEY` clauses despite the DDL example below | Delete order is for human reading, not Exasol enforcement |
+| `DIMENSIONS.DIM_TABLE_ALIAS` | First 3 alphanum lowercase chars of dim-table name + collision suffix (`_sanitize_alias` in deployer) | For `DIM*`-named tables, naturally yields `dim/dim1/dim2/...`. For e.g. `CALENDAR` → `cal`. |
+| `MODELS_IDS` in CREATE VIRTUAL SCHEMA | Subset of MODELS rows you want mounted (rest stay in registry, unmounted) | Registry can hold models that aren't currently exposed |
+
 ## Schema DDL
 
 Created once at install time. Agents do NOT recreate — only INSERT / UPDATE / DELETE rows. The schema name is `SQLCUBE_REGISTRY` by default, overridable via `settings.exa_registry_schema` in the studio backend.
@@ -143,9 +156,14 @@ If a check returns `object SQLCUBE_REGISTRY.X not found` → route to `install.m
 
 ## Population semantics
 
-### Upsert by `DOMAIN_ID`
+### Upsert by `DOMAIN_ID` (logical) — two-pass DELETE in studio code
 
-The skill never tries to diff. It deletes everything for a domain (in FK-correct order) then re-inserts. Reference: `sqlcube_builder.py:build_registry_sql()`.
+The skill never tries to diff. It deletes everything for a domain then re-inserts. References:
+
+- `sqlcube_builder.py:build_registry_sql()` — handles DOMAINS / ATTRIBUTES / JOIN_PATHS
+- `deployer.py:_build_runtime_registry_sql()` — handles MODELS / DIMENSIONS / MEASURES / JOINS / DERIVED_MEASURES, **with an extra purge pass keyed on `(FACT_SCHEMA, FACT_TABLE)`** to clear stale `MODEL_ID` slugs from earlier deploys against the same fact table
+
+The DDL shown above declares `FOREIGN KEY` clauses for clarity, but `build_registry_ddl()` ships the registry **without enforced FKs** — delete order is for human readability, not Exasol enforcement. You can replay the deletes in any order and Exasol won't complain.
 
 Delete order (each scoped to a single `DOMAIN_ID`):
 
@@ -160,11 +178,14 @@ DELETE FROM SQLCUBE_REGISTRY.ATTRIBUTES       WHERE DOMAIN_ID = '<dom>';
 DELETE FROM SQLCUBE_REGISTRY.DOMAINS          WHERE DOMAIN_ID = '<dom>';
 ```
 
-Then INSERT order:
+Then INSERT order (live-verified from `deployer.py:deploy()`):
 
 ```
-DOMAINS → ATTRIBUTES → JOIN_PATHS → MODELS → DIMENSIONS → MEASURES → DERIVED_MEASURES → JOINS
+build_registry_sql phase:        DOMAINS → ATTRIBUTES → JOIN_PATHS
+_build_runtime_registry_sql:     MODELS → JOINS → DIMENSIONS → MEASURES → DERIVED_MEASURES
 ```
+
+JOINS lands **before** DIMENSIONS in the actual code path (DIMENSIONS reference alias values that JOINS rows define). Since the registry has no enforced FKs, order doesn't matter for correctness — but matching the deployer keeps your hand-written batches grep-compatible with what the studio writes.
 
 RCLS_* tables are not touched by this skill. They're populated by a separate security skill (planned).
 
@@ -190,21 +211,21 @@ INSERT INTO SQLCUBE_REGISTRY.MODELS
   (MODEL_ID, DOMAIN_ID, MODEL_LABEL, FACT_SCHEMA, FACT_TABLE, GRAIN_KEY,
    OWNER_NAME, OWNER_TYPE, IS_SYSTEM_MANAGED, IS_ACTIVE, VERSION)
 VALUES (
-  'factinternetsales',
+  'internet_sales',
   'internet_sales',
   'Internet Sales',
   'ADVENTUREWORKS',
   'FACTINTERNETSALES',
-  'SALESORDERNUMBER,SALESORDERLINENUMBER',
+  NULL,
   NULL, NULL, FALSE, TRUE, 1
 );
 ```
 
-- `MODEL_ID`: short slug, lowercase. Becomes the virtual table name inside the virtual schema.
-- `DOMAIN_ID`: FK into DOMAINS.
+- `MODEL_ID`: short slug, lowercase. Becomes the virtual table name inside the virtual schema. **In this codebase the deployer sets `MODEL_ID = DOMAIN_ID` — don't pick a different value.**
+- `DOMAIN_ID`: FK into DOMAINS (logical only — see the conventions table; no enforced FK).
 - `MODEL_LABEL`: human display name (shown in tooling).
 - `FACT_SCHEMA` + `FACT_TABLE`: fully qualified physical reference.
-- `GRAIN_KEY`: comma-separated column list that uniquely identifies a row in the fact. Used by the adapter for sanity-checking and for `COUNT_DISTINCT` shortcuts.
+- `GRAIN_KEY`: column exists for future use. **The studio deployer writes NULL** (`deployer.py:431`). Don't bother populating it — the adapter doesn't read it.
 - `IS_SYSTEM_MANAGED`: TRUE for system-generated rollup models, FALSE for user-defined. Default FALSE.
 - `IS_ACTIVE`: FALSE soft-disables the model without deleting metadata.
 
@@ -215,14 +236,14 @@ INSERT INTO SQLCUBE_REGISTRY.DIMENSIONS
   (DIM_ID, MODEL_ID, VIRTUAL_COL, PHYSICAL_TABLE, PHYSICAL_COL,
    DIM_TABLE_ALIAS, DATA_TYPE, IS_VISIBLE, SORT_ORDER)
 VALUES
-  (1, 'factinternetsales', 'Englishproductname', 'ADVENTUREWORKS.DIMPRODUCT',  'ENGLISHPRODUCTNAME', 'dim',  'VARCHAR(50) UTF8',  TRUE, 10),
-  (2, 'factinternetsales', 'Maritalstatus',      'ADVENTUREWORKS.DIMCUSTOMER', 'MARITALSTATUS',      'dim1', 'VARCHAR(1) UTF8',   FALSE, 160),
-  (3, 'factinternetsales', 'Calendaryear',       'ADVENTUREWORKS.DIMDATE',     'CALENDARYEAR',       'dim2', 'DECIMAL(4,0)',      TRUE, 20);
+  (1, 'internet_sales', 'English Product Name', 'ADVENTUREWORKS.DIMPRODUCT',  'ENGLISHPRODUCTNAME', 'dim',  'VARCHAR(50) UTF8',  TRUE, 10),
+  (2, 'internet_sales', 'Marital Status',       'ADVENTUREWORKS.DIMCUSTOMER', 'MARITALSTATUS',      'dim1', 'VARCHAR(1) UTF8',   FALSE, 160),
+  (3, 'internet_sales', 'Calendar Year',        'ADVENTUREWORKS.DIMDATE',     'CALENDARYEAR',       'dim2', 'DECIMAL(4,0)',      TRUE, 20);
 ```
 
 Critical fields:
 
-- `VIRTUAL_COL`: how analysts and MCP see the column. Title-case-with-trailing-lowercase by convention (e.g., `Englishproductname`). Display layer can rename via ATTRIBUTES.
+- `VIRTUAL_COL`: how analysts and MCP see the column. **Title Case with spaces** (e.g., `English Product Name`) — that's what the LLM enrichment in `claude.py` produces and what lives in real registries today. Quote in SELECTs. Display layer can rename via ATTRIBUTES.
 - `PHYSICAL_TABLE` is `<SCHEMA>.<TABLE>` fully qualified.
 - `DIM_TABLE_ALIAS` is the alias the adapter uses in the generated SQL — must match a `JOINS.DIM_ALIAS` for the same model. `dim` / `dim1` / `dim2` is the convention; the adapter doesn't care about the exact name as long as alias-graph consistency holds.
 - `IS_VISIBLE = FALSE` keeps the column in the registry but hides it from query surfaces (the adapter filters by this flag during `load_model_meta()`).
@@ -235,9 +256,9 @@ INSERT INTO SQLCUBE_REGISTRY.MEASURES
   (MEASURE_ID, MODEL_ID, VIRTUAL_COL, AGG_TYPE,
    PHYSICAL_EXPR, FILTER_EXPR, DATA_TYPE, FORMAT_MASK, IS_VISIBLE)
 VALUES
-  (1, 'factinternetsales', 'Extended Amount',  'SUM',            'f.EXTENDEDAMOUNT',    NULL, 'DECIMAL(19,4)',   '$#,##0.00', TRUE),
-  (2, 'factinternetsales', 'Order Count',      'COUNT_DISTINCT', 'f.SALESORDERNUMBER',  NULL, 'VARCHAR(20) UTF8', '#,##0',     TRUE),
-  (3, 'factinternetsales', 'Gross Margin %',   'AVG',            '(f.UNITPRICE - f.TOTALPRODUCTCOST) / NULLIF(f.UNITPRICE,0)', NULL, 'DECIMAL(9,4)', '0.00%', TRUE);
+  (1, 'internet_sales', 'Extended Amount',  'SUM',            'f.EXTENDEDAMOUNT',    NULL, 'DECIMAL(19,4)',   '$#,##0.00', TRUE),
+  (2, 'internet_sales', 'Order Count',      'COUNT_DISTINCT', 'f.SALESORDERNUMBER',  NULL, 'VARCHAR(20) UTF8', '#,##0',     TRUE),
+  (3, 'internet_sales', 'Gross Margin %',   'AVG',            '(f.UNITPRICE - f.TOTALPRODUCTCOST) / NULLIF(f.UNITPRICE,0)', NULL, 'DECIMAL(9,4)', '0.00%', TRUE);
 ```
 
 Key conventions:
@@ -255,7 +276,7 @@ INSERT INTO SQLCUBE_REGISTRY.DERIVED_MEASURES
   (DERIVED_ID, MODEL_ID, VIRTUAL_COL, FORMULA, DEPENDS_ON,
    DATA_TYPE, FORMAT_MASK, IS_VISIBLE)
 VALUES (
-  1, 'factinternetsales', 'Gross Margin',
+  1, 'internet_sales', 'Gross Margin',
   '"Extended Amount" - "Total Product Cost"',
   'Extended Amount,Total Product Cost',
   'DECIMAL(19,4)', '$#,##0.00', TRUE
@@ -272,11 +293,11 @@ VALUES (
 INSERT INTO SQLCUBE_REGISTRY.JOINS
   (JOIN_ID, MODEL_ID, DIM_TABLE, DIM_ALIAS, DIM_KEY, FACT_FK, JOIN_TYPE, JOIN_ORDER)
 VALUES
-  (1, 'factinternetsales', 'ADVENTUREWORKS.DIMPRODUCT',           'dim',  'PRODUCTKEY',         'PRODUCTKEY',         'LEFT', 10),
-  (2, 'factinternetsales', 'ADVENTUREWORKS.DIMCUSTOMER',          'dim1', 'CUSTOMERKEY',        'CUSTOMERKEY',        'LEFT', 20),
-  (3, 'factinternetsales', 'ADVENTUREWORKS.DIMDATE',              'dim2', 'DATEKEY',            'ORDERDATEKEY',       'LEFT', 30),
-  (4, 'factinternetsales', 'ADVENTUREWORKS.DIMDATE',              'dim3', 'DATEKEY',            'SHIPDATEKEY',        'LEFT', 31),
-  (5, 'factinternetsales', 'ADVENTUREWORKS.DIMSALESTERRITORY',    'dim4', 'SALESTERRITORYKEY',  'SALESTERRITORYKEY',  'LEFT', 40);
+  (1, 'internet_sales', 'ADVENTUREWORKS.DIMPRODUCT',           'dim',  'PRODUCTKEY',         'PRODUCTKEY',         'LEFT', 10),
+  (2, 'internet_sales', 'ADVENTUREWORKS.DIMCUSTOMER',          'dim1', 'CUSTOMERKEY',        'CUSTOMERKEY',        'LEFT', 20),
+  (3, 'internet_sales', 'ADVENTUREWORKS.DIMDATE',              'dim2', 'DATEKEY',            'ORDERDATEKEY',       'LEFT', 30),
+  (4, 'internet_sales', 'ADVENTUREWORKS.DIMDATE',              'dim3', 'DATEKEY',            'SHIPDATEKEY',        'LEFT', 31),
+  (5, 'internet_sales', 'ADVENTUREWORKS.DIMSALESTERRITORY',    'dim4', 'SALESTERRITORYKEY',  'SALESTERRITORYKEY',  'LEFT', 40);
 ```
 
 Critical:
@@ -316,10 +337,10 @@ DIMENSIONS rows still need to be inserted per-model to actually surface the colu
 INSERT INTO SQLCUBE_REGISTRY.JOIN_PATHS
   (JOIN_ID, DOMAIN_ID, FACT_TABLE, DIM_TABLE, FACT_KEY_COL, DIM_KEY_COL, JOIN_TYPE)
 VALUES
-  ('factinternetsales_dimdate_orderdatekey', 'internet_sales',
+  ('internet_sales_dimdate_orderdatekey', 'internet_sales',
    'ADVENTUREWORKS.FACTINTERNETSALES', 'ADVENTUREWORKS.DIMDATE',
    'ORDERDATEKEY', 'DATEKEY', 'LEFT'),
-  ('factinternetsales_dimdate_shipdatekey', 'internet_sales',
+  ('internet_sales_dimdate_shipdatekey', 'internet_sales',
    'ADVENTUREWORKS.FACTINTERNETSALES', 'ADVENTUREWORKS.DIMDATE',
    'SHIPDATEKEY', 'DATEKEY', 'LEFT');
 ```
@@ -340,19 +361,19 @@ FROM SQLCUBE_REGISTRY.MODELS WHERE IS_ACTIVE;
 -- All measures for a model:
 SELECT VIRTUAL_COL, AGG_TYPE, PHYSICAL_EXPR, FORMAT_MASK
 FROM SQLCUBE_REGISTRY.MEASURES
-WHERE MODEL_ID = 'factinternetsales' AND IS_VISIBLE
+WHERE MODEL_ID = 'internet_sales' AND IS_VISIBLE
 ORDER BY MEASURE_ID;
 
 -- Join graph for a model:
 SELECT JOIN_ORDER, DIM_TABLE, DIM_ALIAS, DIM_KEY, FACT_FK, JOIN_TYPE
 FROM SQLCUBE_REGISTRY.JOINS
-WHERE MODEL_ID = 'factinternetsales'
+WHERE MODEL_ID = 'internet_sales'
 ORDER BY JOIN_ORDER;
 
 -- All dims exposed by a model, with their aliases:
 SELECT D.VIRTUAL_COL, D.PHYSICAL_TABLE, D.PHYSICAL_COL, D.DIM_TABLE_ALIAS
 FROM SQLCUBE_REGISTRY.DIMENSIONS D
-WHERE D.MODEL_ID = 'factinternetsales' AND D.IS_VISIBLE
+WHERE D.MODEL_ID = 'internet_sales' AND D.IS_VISIBLE
 ORDER BY D.SORT_ORDER;
 
 -- Measure dependency sanity:
@@ -375,7 +396,7 @@ That last one is approximate — it doesn't recursively resolve dim aliases. For
 
 ```yaml
 measures:
-  - model: factinternetsales
+  - model: internet_sales
     virtual_col: "Net Margin"
     agg_type: SUM
     physical_expr: "(f.UNITPRICE - f.TOTALPRODUCTCOST) * f.ORDERQUANTITY"
@@ -388,8 +409,8 @@ measures:
 
 ```yaml
 dimensions:
-  - model: factinternetsales
-    virtual_col: "Englishproductname"
+  - model: internet_sales
+    virtual_col: "English Product Name"
     visible: true
     sort_order: 5
 attributes:

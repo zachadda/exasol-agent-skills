@@ -62,15 +62,15 @@ This is the part most likely to surprise.
 | Layer | Purpose | Table | Identifier |
 |---|---|---|---|
 | **DOMAINS** | Business-grouping concept above models. Holds attribute renames and alternative join paths. | `DOMAINS` | `DOMAIN_ID` (e.g., `internet_sales`) |
-| **MODELS** | One per fact-table grain. Carries the join graph and measures specific to that fact. | `MODELS` | `MODEL_ID` (e.g., `factinternetsales`, `factresellersales`) |
+| **MODELS** | One per fact-table grain. Carries the join graph and measures specific to that fact. | `MODELS` | `MODEL_ID` (e.g., `internet_sales`, `reseller_sales`) — **the studio deployer assigns `MODEL_ID == DOMAIN_ID`** |
 
 Why two layers:
 
 - **Multiple models per domain.** A `sales` domain can have `internet_sales`, `reseller_sales`, `store_sales` models — different facts but they share dim renames and a single business surface.
-- **Multiple grains per fact.** Same physical fact may appear as several models: atomic (`factinternetsales`), by-month rollup (`factinternetsales_by_month`), by-product (`factinternetsales_by_dimproduct`). Each is a separate MODELS row; each is a separate virtual table inside the same virtual schema.
+- **Multiple grains per fact.** Same physical fact may appear as several models: atomic (`internet_sales`), by-month rollup (`internet_sales_by_month`), by-product (`internet_sales_by_dimproduct`). Each is a separate MODELS row with its own DOMAIN_ID; each is a separate virtual table inside the same virtual schema.
 - **Attributes vs Dimensions.** `ATTRIBUTES` (domain-level) define the display name and type for a physical column. `DIMENSIONS` (model-level) pull a chosen subset of those attribute physicals into a specific model's surface. The same column can be exposed by multiple models via DIMENSIONS rows, each referencing a possibly-different alias.
 
-For simple use cases (one fact, one domain), Domain and Model end up nearly redundant. That's fine — populate both with the same id and move on. The two-layer separation matters when the model count grows.
+For simple use cases (one fact, one domain), Domain and Model end up nearly redundant. That's fine — and in this codebase `deployer.py:_build_runtime_registry_sql` always assigns `MODEL_ID = DOMAIN_ID` anyway, so you'd populate them with the same id even if you wanted them different. The two-layer separation matters at the schema level (DIMENSIONS keys off MODEL_ID, ATTRIBUTES keys off DOMAIN_ID) when the model count grows.
 
 ## Virtual schema naming convention
 
@@ -108,10 +108,10 @@ CREATE VIRTUAL SCHEMA "SQLCUBE_ADVENTUREWORKS"
   WITH
     IS_LOCAL = 'true'
     LAYER_ID = 'ADVENTUREWORKS'
-    MODEL_IDS = 'factinternetsales,factresellersales,factinternetsales_by_month';
+    MODEL_IDS = 'internet_sales,factresellersales,internet_sales_by_month';
 ```
 
-One virtual schema, multiple models. Each model id from `MODEL_IDS` becomes a separate virtual table. Inside the schema: `SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"` works.
+One virtual schema, multiple models. Each model id from `MODEL_IDS` becomes a separate virtual table. Inside the schema: `SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"` works.
 
 ### Single-model (legacy)
 
@@ -120,7 +120,7 @@ CREATE VIRTUAL SCHEMA "SQLCUBE_FACTINTERNETSALES"
   USING SQLCUBE.ADAPTER
   WITH
     IS_LOCAL = 'true'
-    MODEL_ID = 'factinternetsales';
+    MODEL_ID = 'internet_sales';
 ```
 
 One virtual schema, one model. Older deployments shipped this way — each model got its own virtual schema. Still supported, still works. New flows should use multi-domain unless there's a specific reason.

@@ -4,19 +4,19 @@ Canonical SELECT shapes against a live SQLCube virtual schema. Reflects the live
 
 ## Schema reference for examples
 
-Assume the multi-domain layer `SQLCUBE_ADVENTUREWORKS` with one model `factinternetsales`:
+Assume the multi-domain layer `SQLCUBE_ADVENTUREWORKS` with one model `internet_sales` (live shape on `exanano-sqlcube` 2026-05-13; **`MODEL_ID == DOMAIN_ID`** in this codebase — see `meta-model.md`):
 
 ```
 MODELS:
-  factinternetsales (FACT_SCHEMA=ADVENTUREWORKS, FACT_TABLE=FACTINTERNETSALES)
+  internet_sales (FACT_SCHEMA=ADVENTUREWORKS, FACT_TABLE=FACTINTERNETSALES)
 
-DIMENSIONS (selection):
-  Englishproductname     → ADVENTUREWORKS.DIMPRODUCT.ENGLISHPRODUCTNAME       (alias dim)
-  Color                  → ADVENTUREWORKS.DIMPRODUCT.COLOR                    (alias dim)
-  Firstname              → ADVENTUREWORKS.DIMCUSTOMER.FIRSTNAME               (alias dim1)
-  Englishmonthname       → ADVENTUREWORKS.DIMDATE.ENGLISHMONTHNAME            (alias dim2)
-  Calendaryear           → ADVENTUREWORKS.DIMDATE.CALENDARYEAR                (alias dim2)
-  Salesterritoryregion   → ADVENTUREWORKS.DIMSALESTERRITORY.SALESTERRITORYREGION (alias dim4)
+DIMENSIONS (selection — VIRTUAL_COL is Title Case with spaces):
+  English Product Name   → ADVENTUREWORKS.DIMPRODUCT.ENGLISHPRODUCTNAME           (alias dim)
+  Color                  → ADVENTUREWORKS.DIMPRODUCT.COLOR                        (alias dim)
+  First Name             → ADVENTUREWORKS.DIMCUSTOMER.FIRSTNAME                   (alias dim1)
+  English Month Name     → ADVENTUREWORKS.DIMDATE.ENGLISHMONTHNAME                (alias dim5)
+  Calendar Year          → ADVENTUREWORKS.DIMDATE.CALENDARYEAR                    (alias dim5)
+  Sales Territory Region → ADVENTUREWORKS.DIMSALESTERRITORY.SALESTERRITORYREGION  (alias dim4)
 
 MEASURES:
   Extended Amount       SUM            f.EXTENDEDAMOUNT
@@ -32,7 +32,6 @@ Cube queries are flat SELECTs against a single virtual table:
 SELECT <columns_from_DIMENSIONS_or_MEASURES>
 FROM "<VIRTUAL_SCHEMA>"."<lowercase_model_id>"
 [WHERE <predicate>]
-[GROUP BY ...]
 [ORDER BY ...]
 [LIMIT ...]
 ```
@@ -42,15 +41,38 @@ The user lists **what** they want; the adapter handles **how** (joins, aggregati
 **Critical syntax detail**: the virtual table is lowercase and lives inside the virtual schema. **Always use quoted identifiers**:
 
 ```sql
-SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales" LIMIT 1;
+SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales" LIMIT 1;
 ```
 
 Unquoted `SELECT * FROM SQLCUBE_ADVENTUREWORKS.factinternetsales` does NOT work — Exasol uppercases the table reference and the lowercase virtual table name no longer matches.
 
+## GROUP BY semantics — live-verified 2026-05-13
+
+The adapter auto-groups by every DIMENSIONS column appearing in SELECT. Writing an explicit `GROUP BY` with a bare measure name fails with `not a valid GROUP BY expression`. Two shapes work:
+
+| Shape | Example | When |
+|---|---|---|
+| **Implicit (recommended)** | `SELECT "Calendar Year", "Sales Amount" FROM ... ORDER BY 1` | Adapter derives GROUP BY from the dim columns in SELECT. Cleanest. |
+| **Explicit wrap** | `SELECT "Calendar Year" AS "bucket", SUM("Sales Amount") AS "amount" FROM ... GROUP BY 1` | When external tooling requires explicit GROUP BY (e.g. some BI engines). Wrap the measure in its AGG_TYPE and reference dims by position. |
+
+Does NOT work:
+
+```sql
+-- ✗ Bare measure + explicit GROUP BY → "not a valid GROUP BY expression"
+SELECT "Calendar Year", "Sales Amount"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
+GROUP BY "Calendar Year";
+
+-- ✗ Bare measure + positional GROUP BY → same error
+SELECT "Calendar Year", "Sales Amount" FROM ... GROUP BY 1;
+```
+
+Rule of thumb for agents: omit GROUP BY entirely unless you also wrap every measure in its aggregate function.
+
 ## Pattern 1: Just sample data
 
 ```sql
-SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales" LIMIT 5;
+SELECT * FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales" LIMIT 5;
 ```
 
 Returns a **wide denormalized** row: all visible DIMENSIONS columns + all visible MEASURES, with measures aggregated over the natural fact-table grain (no group-by means one row per fact-table grain, which is usually overkill — LIMIT first).
@@ -63,7 +85,7 @@ Use this to confirm the cube is wired correctly before issuing real queries.
 SELECT
   "Extended Amount" AS revenue,
   "Order Count" AS orders
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales";
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales";
 ```
 
 Returns one row. The adapter sees no DIMENSIONS columns in the SELECT, so it skips GROUP BY entirely and aggregates over the whole fact.
@@ -81,17 +103,16 @@ No dims, no joins. Cheapest query you can write.
 ## Pattern 3: Group by one dimension
 
 ```sql
-SELECT "Englishproductname", "Extended Amount"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-GROUP BY "Englishproductname"
+SELECT "English Product Name", "Extended Amount"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
 ORDER BY "Extended Amount" DESC
 LIMIT 10;
 ```
 
-The adapter sees one DIMENSIONS column and one MEASURE. It generates:
+No `GROUP BY` — the adapter sees one DIMENSIONS column (`"English Product Name"`) and one MEASURE (`"Extended Amount"`), groups implicitly. It generates:
 
 ```sql
-SELECT dim.ENGLISHPRODUCTNAME                          AS "Englishproductname",
+SELECT dim.ENGLISHPRODUCTNAME                          AS "English Product Name",
        SUM(f.EXTENDEDAMOUNT)                           AS "Extended Amount"
 FROM ADVENTUREWORKS.FACTINTERNETSALES f
 LEFT JOIN ADVENTUREWORKS.DIMPRODUCT dim ON f.PRODUCTKEY = dim.PRODUCTKEY
@@ -102,23 +123,32 @@ LIMIT 10;
 
 The dim alias (`dim`) comes from the DIMENSIONS row. The JOIN line comes from the JOINS row with `DIM_ALIAS='dim'`.
 
+If your tooling forces an explicit GROUP BY, use the wrap shape:
+
+```sql
+SELECT "English Product Name" AS "product",
+       SUM("Extended Amount") AS "revenue"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
+GROUP BY 1
+ORDER BY 2 DESC LIMIT 10;
+```
+
 ## Pattern 4: Multi-dimensional group
 
 ```sql
-SELECT "Salesterritoryregion", "Calendaryear", "Extended Amount", "Order Count"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-GROUP BY "Salesterritoryregion", "Calendaryear"
-ORDER BY "Salesterritoryregion", "Calendaryear";
+SELECT "Sales Territory Region", "Calendar Year", "Extended Amount", "Order Count"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
+ORDER BY "Sales Territory Region", "Calendar Year";
 ```
 
-The adapter walks dims and measures, infers the join graph from JOINS rows, emits the SQL. The user never writes joins.
+The adapter walks dims and measures, infers the join graph from JOINS rows, emits the SQL. The user never writes joins or GROUP BY.
 
 ## Pattern 5: Filtered KPI
 
 ```sql
 SELECT "Extended Amount"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-WHERE "Calendaryear" = 2013;
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
+WHERE "Calendar Year" = 2013;
 ```
 
 Predicates on dimension columns push through to the joined dim table:
@@ -133,23 +163,21 @@ WHERE dim2.CALENDARYEAR = 2013;
 ## Pattern 6: Top-N by measure
 
 ```sql
-SELECT "Firstname", "Lastname", "Extended Amount"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-GROUP BY "Firstname", "Lastname"
+SELECT "First Name", "Last Name", "Extended Amount"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
 ORDER BY "Extended Amount" DESC
 LIMIT 10;
 ```
 
-Standard. ORDER BY + LIMIT push down — the adapter doesn't materialize all rows.
+Standard. ORDER BY + LIMIT push down — the adapter doesn't materialize all rows. No explicit GROUP BY.
 
 ## Pattern 7: Derived measure
 
 If `DERIVED_MEASURES` has `"Gross Profit"` with formula `"Extended Amount" - "Total Product Cost"`:
 
 ```sql
-SELECT "Englishproductname", "Gross Profit"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-GROUP BY "Englishproductname"
+SELECT "English Product Name", "Gross Profit"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
 ORDER BY "Gross Profit" DESC
 LIMIT 10;
 ```
@@ -167,13 +195,12 @@ FROM ...
 When two JOINS rows reference the same dim (different aliases), DIMENSIONS rows distinguish via the `DIM_TABLE_ALIAS`:
 
 If DIMENSIONS has:
-- `Orderdate Year` → `DIMDATE.CALENDARYEAR` via alias `dim2`
-- `Shipdate Year` → `DIMDATE.CALENDARYEAR` via alias `dim3`
+- `OrderDate Year` → `DIMDATE.CALENDARYEAR` via alias `dim2`
+- `ShipDate Year` → `DIMDATE.CALENDARYEAR` via alias `dim3`
 
 ```sql
-SELECT "Orderdate Year", "Shipdate Year", "Order Count"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-GROUP BY 1, 2
+SELECT "OrderDate Year", "ShipDate Year", "Order Count"
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
 ORDER BY 1, 2;
 ```
 
@@ -195,10 +222,9 @@ Workaround for window-over-aggregate (rank top customers by revenue):
 
 ```sql
 WITH rev AS (
-  SELECT "Firstname" || ' ' || "Lastname" AS customer,
+  SELECT "First Name" || ' ' || "Last Name" AS customer,
          "Extended Amount" AS revenue
-  FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-  GROUP BY "Firstname", "Lastname"
+  FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
 )
 SELECT customer, revenue,
        RANK() OVER (ORDER BY revenue DESC) AS rk
@@ -206,6 +232,8 @@ FROM rev
 ORDER BY rk
 LIMIT 10;
 ```
+
+The inner CTE uses the implicit-GROUP-BY shape (`"Extended Amount"` is auto-aggregated over the SELECTed dims). The outer SELECT operates on regular columns and is free to use window functions.
 
 ## Verifying a fresh cube
 
@@ -224,11 +252,18 @@ DESCRIBE "<lowercase_model_id>";
 -- 3. Sample
 SELECT * FROM "<lowercase_model_id>" LIMIT 3;
 
--- 4. KPI shape
+-- 4. KPI shape (no GROUP BY — one row aggregate)
 SELECT "<MEASURE_1>", "<MEASURE_2>" FROM "<lowercase_model_id>";
 
--- 5. Group-by shape
+-- 5. Group-by shape (implicit — adapter groups by SELECTed dims)
 SELECT "<DIM_COL>", "<MEASURE_1>"
+FROM "<lowercase_model_id>"
+ORDER BY "<MEASURE_1>" DESC
+LIMIT 5;
+
+-- 5b. Group-by shape (explicit wrap — if tool requires GROUP BY)
+SELECT "<DIM_COL>" AS "bucket",
+       <AGG_TYPE>("<MEASURE_1>") AS "amount"
 FROM "<lowercase_model_id>"
 GROUP BY 1
 ORDER BY 2 DESC
@@ -252,12 +287,11 @@ The adapter doesn't cache. Every query against the virtual schema reads the regi
 For dashboards firing multiple panel queries against the same cube: prefer **one wide query** returning all needed measures and dims, GROUP BY everything at once. The adapter is smart enough to fuse measures into a single SELECT — issuing N separate single-measure queries pays N round-trips.
 
 ```sql
--- One query, multiple measures + dims:
-SELECT "Englishproductname", "Calendaryear",
+-- One query, multiple measures + dims (no GROUP BY — adapter groups by all SELECTed dims):
+SELECT "English Product Name", "Calendar Year",
        "Extended Amount", "Order Count", "Gross Margin %"
-FROM "SQLCUBE_ADVENTUREWORKS"."factinternetsales"
-GROUP BY "Englishproductname", "Calendaryear"
-ORDER BY "Englishproductname", "Calendaryear";
+FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
+ORDER BY "English Product Name", "Calendar Year";
 
 -- vs three separate queries — same data, three round-trips, three rewrites.
 ```
@@ -269,8 +303,8 @@ The adapter is strict about identifier casing because Exasol is strict:
 | Reference | Casing in the registry | Casing in queries |
 |---|---|---|
 | Virtual schema name | `SQLCUBE_<LAYER_UPPER>` | Quoted or unquoted; Exasol will uppercase if unquoted |
-| Virtual table name | lowercase model_id (e.g., `factinternetsales`) | **MUST be quoted lowercase** |
-| Virtual column name | as stored in DIMENSIONS.VIRTUAL_COL | **MUST be quoted in mixed case**; Exasol uppercases unquoted |
+| Virtual table name | lowercase model_id (e.g., `internet_sales`) | **MUST be quoted lowercase** |
+| Virtual column name | as stored in DIMENSIONS.VIRTUAL_COL — Title Case with spaces (e.g., `English Product Name`) | **MUST be quoted with exact case + spaces**; Exasol uppercases and rejects spaces unquoted |
 | Physical schema/table/column in registry | uppercase (Exasol native) | n/a (adapter generates) |
 
 Always quote virtual-table and virtual-column names in SQL emitted by the agent.

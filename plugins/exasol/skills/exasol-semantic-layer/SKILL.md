@@ -123,7 +123,7 @@ If either fails → route to the satisfying skill before proceeding.
 ## Conventions
 
 - **Virtual schema naming.** `SQLCUBE_<LAYER_ID>` where layer_id = sanitized source_schema. ADVENTUREWORKS → `SQLCUBE_ADVENTUREWORKS`. Sanitizer (`_safe_identifier_token`) uppercases, replaces non-alnum with underscore, collapses repeats, truncates to 120 chars.
-- **One MODELS row per fact-table grain.** `MODEL_ID` is a short stable identifier (e.g., `factinternetsales`); `FACT_SCHEMA` + `FACT_TABLE` qualify the underlying table.
+- **One MODELS row per fact-table grain.** `MODEL_ID` is a short stable identifier (e.g., `internet_sales`); `FACT_SCHEMA` + `FACT_TABLE` qualify the underlying table. The studio deployer always assigns `MODEL_ID == DOMAIN_ID` — see `references/meta-model.md` conventions.
 - **Multiple models per source schema = multi-domain.** All share one virtual schema. Each model becomes a virtual table inside (lowercase model_id).
 - **DIMENSIONS are column-level, not table-level.** Each row exposes one virtual column from one physical dim. `DIM_TABLE_ALIAS` (e.g., `dim`, `dim1`) ties back to the JOINS row that brings the dim in.
 - **MEASURES are inner expressions + AGG_TYPE.** `PHYSICAL_EXPR='f.EXTENDEDAMOUNT'` and `AGG_TYPE='SUM'` are stored separately so the adapter can compose `SUM(f.EXTENDEDAMOUNT)` at query time. Use `f` as the fact alias by convention.
