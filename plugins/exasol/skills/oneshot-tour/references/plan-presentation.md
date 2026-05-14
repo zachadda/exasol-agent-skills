@@ -12,15 +12,15 @@ Show the user exactly what's about to happen, in concrete terms, before any tool
 agent:
   ## Plan
 
-  Resolved 6 steps for `source_schema = ACME_DEMO`, target `CUBE_ACME_ADVENTUREWORKS`.
+  Resolved 6 steps for `source_schema = ACME_DEMO`, target `SQLCUBE_ACME_ADVENTUREWORKS`.
 
   | # | Step                              | Skill                       | Estimated impact            |
   |---|-----------------------------------|-----------------------------|-----------------------------|
   | 1 | Boot Nano                         | exasol-nano-local           | 5 sec, no DB changes        |
-  | 2 | Connect to Snowflake              | exasol-migrate-snowflake    | New CONNECTION object       |
-  | 3 | Import schema → STAGE_ACME_ADVENTUREWORKS | exasol-migrate-snowflake | ~14 tables, ~146k rows, ~2 min |
-  | 4 | Optimize STAGE_ACME_ADVENTUREWORKS | exasol-optimize             | ~23 ALTER statements, 30 sec |
-  | 5 | Create cube CUBE_ACME_ADVENTUREWORKS | exasol-semantic-layer    | SQLCUBE_META rows + virtual schema |
+  | 2 | Connect to Snowflake              | exasol-migrate (snowflake)  | New CONNECTION object       |
+  | 3 | Import schema → ACME_ADVENTUREWORKS | exasol-migrate (snowflake) | ~14 tables, ~146k rows, ~2 min |
+  | 4 | Optimize ACME_ADVENTUREWORKS      | exasol-optimize             | ~23 ALTER statements, 30 sec |
+  | 5 | Create cube SQLCUBE_ACME_ADVENTUREWORKS | exasol-semantic-layer | SQLCUBE_REGISTRY rows + virtual schema |
   | 6 | Verify + render dashboard         | exasol-dashboard            | 1 sample query + local HTML |
 
   - LLM enrichment: **on** (will refine names/groupings at steps 4 + 5)
@@ -70,7 +70,7 @@ Each domain skill declares an `estimated_impact` string in its frontmatter (TBD 
 | 2 | "New CONNECTION object" or "Reusing existing" |
 | 3 | "~{N} tables, ~{M} rows, ~{Tmin} min" — N from `SHOW SCHEMAS` count, M from `IMPORT` preview, Tmin estimated 1 min per 100k rows |
 | 4 | "~{N} ALTER statements, 30 sec" — N from `ANALYZE_CONSTRAINTS` dry-run count |
-| 5 | "SQLCUBE_META rows + virtual schema" |
+| 5 | "SQLCUBE_REGISTRY rows + virtual schema" |
 | 6 | "1 sample query + local HTML" |
 
 If any of the source-side counts can't be determined cheaply (slow Snowflake `INFORMATION_SCHEMA` queries), omit the estimate and write "rows count tbd".

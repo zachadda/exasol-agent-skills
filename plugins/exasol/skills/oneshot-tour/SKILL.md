@@ -69,8 +69,8 @@ The skill runs in five phases. Load the matching reference file at each phase.
 | # | Skill responsible | Provides |
 |---|---|---|
 | 1 | `exasol-nano-local` | `nano_running` |
-| 2 | `exasol-migrate-snowflake` (or s3 / jdbc variant) | `source_connected` |
-| 3 | `exasol-migrate-snowflake` (continues) | `schema_imported` |
+| 2 | `exasol-migrate` (vendor variant: snowflake / s3 / generic JDBC) | `source_connected` |
+| 3 | `exasol-migrate` (continues) | `schema_imported` |
 | 4 | `exasol-optimize` | `schema_optimized` (calls `ANALYZE_CONSTRAINTS` + `DRY_RUN_PLAN`) |
 | 5 | `exasol-semantic-layer` | `cube_live` |
 | 6 | `exasol-dashboard` | `dashboard_rendered` |
@@ -119,9 +119,9 @@ See `specs/_plans/oneshot-tour/transcript-v0.1.md` (in the factory-foundation re
 ## Related Skills
 
 - **exasol-nano-local** — Step 1: Docker Nano boot + port + JDBC dir
-- **exasol-migrate-snowflake** — Steps 2-3: connection + IMPORT INTO
-- **exasol-optimize** — Step 4: constraint inference + DRY_RUN_PLAN
-- **exasol-semantic-layer** — Step 5: cube create + SQLCUBE_META + virtual schema
+- **exasol-migrate** — Steps 2-3: `CREATE CONNECTION` + `EXECUTE SCRIPT EXA_DB_MIGRATION.<vendor>_TO_EXASOL(...)` per `studio/backend/routers/imports.py`. 16 vendors; snowflake is one preset.
+- **exasol-optimize** — Step 4: `EXA_OPTIMIZE.ANALYZE_CONSTRAINTS` + `DRY_RUN_PLAN`
+- **exasol-semantic-layer** — Step 5: `SQLCUBE_REGISTRY` rows (DOMAINS / MODELS / DIMENSIONS / MEASURES / JOINS / JOIN_PATHS / ATTRIBUTES / DERIVED_MEASURES) + `CREATE VIRTUAL SCHEMA` via SQLCube adapter. **Not** `SQLCUBE_META` — that is a different schema (app state + lineage), unrelated to cube metadata.
 - **exasol-dashboard** — Step 6: Vega-Lite spec + local HTML server
 
 These five domain skills are the actual workforce. `/oneshot-tour` is the project manager.

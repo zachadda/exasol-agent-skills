@@ -9,40 +9,54 @@ Prove `cube_live` actually holds by running a deterministic sample query against
 ## What it does
 
 1. Confirm the virtual schema exists in the catalog.
-2. Pick a representative fact + measure from the cube and run one SELECT.
+2. Pick a representative model + measure from the cube and run one SELECT.
 3. Confirm the result is non-empty.
 4. Capture the result for the dashboard render in Phase 5.
 
 ## Verification SQL pattern
 
-The orchestrator generates a query from the cube metadata, not the source schema. Use SQLCUBE_META to discover what's queryable:
+The orchestrator generates a query from the cube metadata in `SQLCUBE_REGISTRY`, not the source schema. Registry shape (canonical: `studio/backend/services/sqlcube_builder.py:build_registry_ddl()`):
+
+- `SQLCUBE_REGISTRY.MODELS(MODEL_ID, DOMAIN_ID, MODEL_LABEL, FACT_SCHEMA, FACT_TABLE, ...)`
+- `SQLCUBE_REGISTRY.MEASURES(MEASURE_ID, MODEL_ID, VIRTUAL_COL, AGG_TYPE, PHYSICAL_EXPR, DATA_TYPE, ...)`
+- `SQLCUBE_REGISTRY.DIMENSIONS(DIM_ID, MODEL_ID, VIRTUAL_COL, PHYSICAL_TABLE, PHYSICAL_COL, DATA_TYPE, ...)`
+- `SQLCUBE_REGISTRY.JOINS(JOIN_ID, MODEL_ID, DIM_TABLE, DIM_KEY, FACT_FK, JOIN_TYPE, JOIN_ORDER)`
+
+Virtual-schema table names = `MODEL_ID` (case-sensitive, quoted). Virtual-schema column names = `VIRTUAL_COL` (display labels with spaces, quoted).
 
 ```sql
 -- 1. Confirm virtual schema exists
 SELECT 1 FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = :target_cube_name;
 
--- 2. Pull the first model from the cube
-SELECT MODEL_NAME, FACT_TABLE FROM SQLCUBE_META.MODELS
-WHERE TARGET_SCHEMA = :target_cube_name
+-- 2. Pick the first model whose FACT_SCHEMA matches the source we imported
+SELECT MODEL_ID, MODEL_LABEL, FACT_TABLE
+FROM SQLCUBE_REGISTRY.MODELS
+WHERE FACT_SCHEMA = :source_schema
+  AND IS_ACTIVE = TRUE
 ORDER BY MODEL_ID
 LIMIT 1;
 
--- 3. Pull one numeric measure + one date-shaped dim attribute on that model
-SELECT MEASURE_NAME FROM SQLCUBE_META.MEASURES
-WHERE MODEL_NAME = :model_name AND AGG_FN IN ('SUM', 'COUNT', 'AVG')
+-- 3. Pull one numeric measure on that model
+SELECT VIRTUAL_COL, AGG_TYPE
+FROM SQLCUBE_REGISTRY.MEASURES
+WHERE MODEL_ID = :model_id
+  AND AGG_TYPE IN ('SUM', 'COUNT', 'COUNT_DISTINCT', 'AVG')
 ORDER BY MEASURE_ID
 LIMIT 1;
 
-SELECT DIM_ATTR_NAME FROM SQLCUBE_META.DIMENSION_ATTRIBUTES
-WHERE MODEL_NAME = :model_name AND DATA_KIND = 'DATE'
-ORDER BY DIM_ATTR_ID
+-- 4. Pull one date-shaped dim on that model (DATA_TYPE LIKE 'DATE%' or DIMENSIONS row mapped to a date col)
+SELECT VIRTUAL_COL
+FROM SQLCUBE_REGISTRY.DIMENSIONS
+WHERE MODEL_ID = :model_id
+  AND (UPPER(DATA_TYPE) LIKE 'DATE%' OR UPPER(DATA_TYPE) LIKE 'TIMESTAMP%')
+ORDER BY DIM_ID
 LIMIT 1;
 
--- 4. Compose + run sample query
+-- 5. Compose + run sample query (note: MODEL_ID and VIRTUAL_COL are case-preserving — quote them)
 SELECT
-  "<dim_attr>" AS bucket,
-  <agg_fn>("<measure>") AS value
-FROM "<target_cube_name>"."<model_name>"
+  "<dim_virtual_col>"          AS bucket,
+  <agg_type>("<measure_virtual_col>") AS value
+FROM "<target_cube_name>"."<model_id>"
 GROUP BY 1
 ORDER BY 1
 LIMIT 10;
@@ -53,7 +67,7 @@ LIMIT 10;
 `cube_live` requires ALL of:
 
 - Virtual schema row exists in `SYS.EXA_VIRTUAL_SCHEMAS`
-- At least one MODEL row in `SQLCUBE_META.MODELS` for the target schema
+- At least one `MODEL` row in `SQLCUBE_REGISTRY.MODELS` whose `FACT_SCHEMA` matches the source
 - The sample SELECT executes without error
 - The sample SELECT returns at least one row
 
@@ -65,24 +79,26 @@ If any of those fails, the cube is broken even if the skills all returned succes
 agent:
   ### Step 6 of 6 — Verify + render dashboard
 
-  Verifying cube `CUBE_ACME_ADVENTUREWORKS`...
+  Verifying cube `SQLCUBE_ADVENTUREWORKS`...
 
     tool: SYS.EXA_VIRTUAL_SCHEMAS lookup ✓
-    tool: SQLCUBE_META.MODELS for target → "Internet Sales" (FACT_INTERNET_SALES)
-    tool: Sample query — first numeric measure × first date dim:
+    tool: SQLCUBE_REGISTRY.MODELS for FACT_SCHEMA=ADVENTUREWORKS → internet_sales (FACTINTERNETSALES)
+    tool: SQLCUBE_REGISTRY.MEASURES → "Sales Amount" (SUM)
+    tool: SQLCUBE_REGISTRY.DIMENSIONS → "Calendar Year" (DECIMAL)
+    tool: Sample query:
 
-      SELECT "Order Year", SUM("Internet Sales Amount") AS "Internet Sales"
-      FROM "CUBE_ACME_ADVENTUREWORKS"."Internet Sales"
+      SELECT "Calendar Year", SUM("Sales Amount") AS "Sales Amount"
+      FROM "SQLCUBE_ADVENTUREWORKS"."internet_sales"
       GROUP BY 1 ORDER BY 1 LIMIT 10;
 
-  ┌──────────────┬──────────────────────────┐
-  │  Order Year  │  Internet Sales          │
-  ├──────────────┼──────────────────────────┤
-  │  2010        │            43,421.04     │
-  │  2011        │         7,075,439.06     │
-  │  2012        │         5,842,485.14     │
-  │  2013        │        16,351,176.85     │
-  └──────────────┴──────────────────────────┘
+  ┌──────────────────┬──────────────────────────┐
+  │  Calendar Year   │  Sales Amount            │
+  ├──────────────────┼──────────────────────────┤
+  │  2010            │            43,421.04     │
+  │  2011            │         7,075,439.06     │
+  │  2012            │         5,842,485.14     │
+  │  2013            │        16,351,176.85     │
+  └──────────────────┴──────────────────────────┘
 
   ✓ Cube is live and returning data.
 ```
@@ -93,19 +109,20 @@ Phase 5 (dashboard) needs:
 
 - The verification query SQL text
 - The verification query result rows (column names + row tuples)
-- The model name and the (dim, measure) pair used
+- The model_id, model_label, and the (dim, measure) pair used
 
 Stash these in `tour_state.verification_sample` so Phase 5 doesn't re-query unnecessarily.
 
 ```yaml
 tour_state:
   verification_sample:
-    model_name:      "Internet Sales"
-    dim_attr:        "Order Year"
-    measure_name:    "Internet Sales Amount"
-    agg_fn:          SUM
-    sql:             "SELECT \"Order Year\", SUM(\"Internet Sales Amount\") ..."
-    columns:         ["Order Year", "Internet Sales"]
+    model_id:        "internet_sales"
+    model_label:     "Internet Sales"
+    dim_virtual_col: "Calendar Year"
+    measure_virtual_col: "Sales Amount"
+    agg_type:        SUM
+    sql:             "SELECT \"Calendar Year\", SUM(\"Sales Amount\") ..."
+    columns:         ["Calendar Year", "Sales Amount"]
     rows:
       - [2010,       43421.04]
       - [2011,    7075439.06]
@@ -118,9 +135,9 @@ tour_state:
 | Failure | User message |
 |---|---|
 | `SYS.EXA_VIRTUAL_SCHEMAS` returns no row | "Virtual schema didn't materialize. Cube create reported success but catalog says otherwise. Re-run step 5 in step_by_step mode." |
-| `SQLCUBE_META.MODELS` empty for target | "Virtual schema is live but no MODEL was registered. Semantic-layer skill misbehaved." |
-| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs |
-| Sample query returns 0 rows | "Cube is live but query returned no rows. Possible model error: dim/measure names don't match facts. Inspect SQLCUBE_META.JOINS." |
+| `SQLCUBE_REGISTRY.MODELS` empty for FACT_SCHEMA | "Virtual schema is live but no MODEL was registered. Semantic-layer skill misbehaved." |
+| Sample query fails to compile | Print the actual error verbatim; suggest checking adapter logs (`SQLCUBE.sqlcube_adapter` script) |
+| Sample query returns 0 rows | "Cube is live but query returned no rows. Possible model error: dim/measure don't connect to facts. Inspect `SQLCUBE_REGISTRY.JOINS` for the model." |
 
 On halt, Phase 5 does NOT run. Tour ends without a dashboard.
 
@@ -128,7 +145,7 @@ On halt, Phase 5 does NOT run. Tour ends without a dashboard.
 
 | Situation | Action |
 |---|---|
-| Cube has multiple models | Use the first one (lowest MODEL_ID). User can inspect others post-tour |
-| No numeric measure exists | Pick `COUNT(*)` and an arbitrary dim attribute |
-| No date dim exists | Pick first text-typed dim attribute |
+| Cube has multiple models for the source | Use the first one (lowest `MODEL_ID`). User can inspect others post-tour |
+| No numeric measure exists | Pick `COUNT(*)` and an arbitrary dim |
+| No date dim exists | Pick first non-numeric dim by `DIM_ID` |
 | Verification query is fast but returns suspicious data (e.g., all nulls) | Surface a warning but don't halt — let user catch this on the dashboard |

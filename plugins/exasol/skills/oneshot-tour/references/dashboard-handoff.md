@@ -18,7 +18,7 @@ End the tour with something the user can *see* (the chart) plus something they c
 The `exasol-dashboard` skill owns the actual rendering. Phase 5 just passes parameters and surfaces the URL.
 
 Input to the skill (from `tour_state.verification_sample`):
-- columns: `["Order Year", "Internet Sales"]`
+- columns: `["Calendar Year", "Sales Amount"]`
 - rows: `[[2010, 43421.04], ...]`
 - chart hint: derived from column types (dim = year → x-axis, measure = numeric → y-axis, type → bar)
 
@@ -57,7 +57,7 @@ agent:
 
   - 14 tables imported
   - 21 constraints applied (2 deferred for manual review)
-  - Virtual schema `CUBE_ACME_ADVENTUREWORKS` live with 2 facts, 10 dimensions, 31 measures
+  - Virtual schema `SQLCUBE_ADVENTUREWORKS` live with 1 model, 23 dimensions, 11 measures
   - Sample dashboard rendered
 
   You're now in query mode. Ask anything against the cube — I'll translate to
@@ -76,7 +76,7 @@ After the dashboard renders, the agent enters a passive listening mode. Any furt
 Flow per follow-up question:
 
 1. User asks a business question in natural language.
-2. Agent uses cube metadata (SQLCUBE_META.MEASURES + DIMENSION_ATTRIBUTES) to ground attribute / measure names.
+2. Agent uses cube metadata (`SQLCUBE_REGISTRY.MEASURES` + `SQLCUBE_REGISTRY.DIMENSIONS`, keyed by `MODEL_ID`) to ground attribute / measure names. Virtual-schema table = `MODEL_ID`; virtual-schema columns = `VIRTUAL_COL` (quoted, case-preserving).
 3. Agent emits SQL against the virtual schema via `mcp__exasol_db__query`.
 4. Agent receives result rows.
 5. Agent decides: table-only response, or table + new chart added to dashboard?
@@ -95,7 +95,7 @@ The orchestrator state persists until:
 
 When session ends, the orchestrator should:
 1. Stop the local HTTP server gracefully.
-2. Print a summary line: "Stopped dashboard server. Cube CUBE_ACME_ADVENTUREWORKS remains queryable."
+2. Print a summary line: "Stopped dashboard server. Cube SQLCUBE_ADVENTUREWORKS remains queryable."
 3. Mark session-end.
 
 ## What the user can do next without the orchestrator

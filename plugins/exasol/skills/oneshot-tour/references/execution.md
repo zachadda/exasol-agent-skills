@@ -158,5 +158,5 @@ This lets users sanity-check between optimize and cube create, etc., without los
 |---|---|
 | Skill takes > 5 minutes | Periodic progress pings every 60s ("still working...") |
 | Domain skill itself prompts for user input mid-execution | Pass-through. The user sees the sub-skill's prompt and responds. Orchestrator resumes when sub-skill returns. |
-| Multiple steps share the same domain skill (e.g. steps 2+3 both use `exasol-migrate-snowflake`) | Load the skill once. Pass distinct task subsets. |
+| Multiple steps share the same domain skill (e.g. steps 2+3 both use `exasol-migrate` for the snowflake vendor) | Load the skill once. Pass distinct task subsets. |
 | Tool call returns successful but data is wrong (e.g. import returns 0 rows) | The `provides.verify` SQL is the gate — if it would fail downstream, it must fail HERE |
