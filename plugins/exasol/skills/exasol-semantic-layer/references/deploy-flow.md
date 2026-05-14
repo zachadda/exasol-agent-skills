@@ -14,6 +14,26 @@ Hand-crafted SQL is the **fallback** for clusters without studio backend reachab
 
 Most environments are Path A.
 
+## Detecting which path to take
+
+Don't guess — probe. The studio backend (Path A) is conditional on a running uvicorn process and a valid session cookie, neither of which an agent should assume.
+
+```bash
+# 1. Reachability — any auth-required endpoint with no cookie returns 401, not connection-refused.
+#    401 means the server IS running and we just need a session.
+HTTP=$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://localhost:8001/api/auth/me || echo 000)
+case "$HTTP" in
+  200) echo "Path A ready (session active)";;
+  401) echo "Path A available — need to authenticate";;
+  000) echo "Path A unavailable — fall back to Path B (UDFs)";;
+  *)   echo "Path A reachable but unexpected status $HTTP — check backend logs";;
+esac
+```
+
+If Path A is available but you need to authenticate: POST `/api/auth/login` with the persona (default `admin`) and password from `studio/backend/.env` (`STUDIO_PASSWORD_HASH` is the SHA-256 of the plaintext; the plaintext lives wherever the operator configured it). The endpoint returns a `session` cookie that every subsequent `/api/*` call must send.
+
+If Path A is unavailable, you can drive Path B from any pyexasol-capable runtime. The studio venv at `studio/backend/.venv/bin/python3` already has pyexasol 2.x installed — no separate `pip install` needed for local dev.
+
 ---
 
 ## Path A: studio-backend-driven (preferred)
@@ -46,8 +66,11 @@ If anything is missing → route to `exasol-optimize` (UDFs) and `install.md` (a
 The cube generator needs PKs + FKs in `SYS.EXA_ALL_CONSTRAINTS` to produce a meaningful join graph. The `exasol-optimize` skill drives this:
 
 ```sql
--- Suggest constraints from data
-SELECT * FROM (EXECUTE SCRIPT EXA_OPTIMIZE.ANALYZE_CONSTRAINTS('ADVENTUREWORKS'));
+-- Suggest constraints from data. Bare EXECUTE SCRIPT only — run via
+-- pyexasol, studio /api/query/execute, or an interactive client. The wrap
+-- form `SELECT * FROM (EXECUTE SCRIPT ...)` is a parser error in Exasol.
+-- See "EXECUTE SCRIPT gotcha" below.
+EXECUTE SCRIPT EXA_OPTIMIZE.ANALYZE_CONSTRAINTS('ADVENTUREWORKS');
 ```
 
 Returns one row per finding (missing PK, inferred FK, nullable FK, etc.) plus the generated `ALTER TABLE` SQL.
@@ -78,6 +101,14 @@ EXECUTE SCRIPT EXA_OPTIMIZE.INFER_JOIN_PATHS('ADVENTUREWORKS');
 ```
 
 Returns one row per inferred fact↔dim join (tier 1: declared FK, tier 2: name-stem match, tier 3: empty-schema fallback). Use the result as the `join_paths` array in the cube model. The UDF does fact/dim classification the same way `services.ddl_parser` does in Python, so the output already lines up with what `/generate` expects.
+
+**Halt-gate: zero rows.** If `INFER_JOIN_PATHS` returns 0 rows, neither declared FKs nor stem-match heuristics found a fact↔dim link. Three scenarios:
+
+1. **No FK constraints declared AND no `*_KEY` / `*_ID` columns on the candidate facts.** The cube would have only fact-table measures, no dim attributes. Cube is essentially useless. Halt and surface to the user: "no joins found — schema is fact-only or needs renaming." Suggest the user either: (a) declare FKs via `ANALYZE_CONSTRAINTS` + `DRY_RUN_PLAN`, or (b) rename dim PKs to a stem the fact's FK columns share, or (c) accept a fact-only cube and proceed manually.
+2. **Tables exist but classifier didn't pick a fact.** No `FACT_*` / `*_FACT` / `*_TXN` / `*_EVT` naming AND no obvious aggregate-row-count winner. Same halt; suggest user pass `fact_table` parameter explicitly.
+3. **Schema is empty.** `SYS.EXA_ALL_TABLES` returns no rows for the source. Route back to `exasol-migrate` — data hasn't landed yet.
+
+Surfaced live 2026-05-14 against the `INVENTORY` fixture on `exanano-sqlcube`: 7 tables, no FK constraints, no FACT-prefixed names, suffix on dim was `_DIM` (caught by `ANALYZE_CONSTRAINTS`) but no fact's FK column shared a stem with any dim's PK → 0 joins. The skill should not silently proceed to step 5 with an empty `join_paths` list — user expects a join graph, will see an empty cube, will not understand why.
 
 ### Step 4 — parse the source DDL
 
@@ -191,7 +222,24 @@ All 10 scripts live in schema `EXA_OPTIMIZE`. Installed by `exasol-optimize` ski
 
 All scripts emit catalog SQL that's portable across Exasol versions — they read `SYS.EXA_ALL_*` views, not version-specific internals.
 
-**`EXECUTE SCRIPT` gotcha** (already in `optimize` SKILL.md, repeated here): `exapump sql --profile foo "EXECUTE SCRIPT ..."` fails with `Result set not available: Expected row count, got result set`. Use pyexasol, the studio backend `/api/query/execute`, or an interactive SQL client (DBeaver, DataGrip) that handles Lua-result-set tables. Or wrap: `SELECT * FROM (EXECUTE SCRIPT ...)` — which most clients accept.
+**`EXECUTE SCRIPT` gotcha** (already in `optimize` SKILL.md, repeated here, **re-verified live 2026-05-14**):
+
+- `exapump sql --profile foo "EXECUTE SCRIPT ..."` fails with `Result set not available: Expected row count, got result set`.
+- `exapump sql --profile foo "SELECT * FROM (EXECUTE SCRIPT ...)"` ALSO fails — `Protocol error: syntax error, unexpected EXECUTE_`. The SQL parser itself rejects the wrap form; there is no client that accepts it. (An earlier revision of this doc claimed otherwise — wrong, verified against `exanano-sqlcube` on `EXA_OPTIMIZE.ANALYZE_CONSTRAINTS('INVENTORY')`.)
+- **Working invocations**: pyexasol's `.execute("EXECUTE SCRIPT ...")` returns a fetchable statement; studio backend's `POST /api/query/execute` handles the result set; interactive clients (DBeaver, DataGrip) that understand Lua RETURNS TABLE work. The studio venv at `studio/backend/.venv/bin/python3` already has pyexasol 2.x — easiest local route.
+
+Minimal pyexasol recipe:
+
+```python
+import pyexasol
+conn = pyexasol.connect(
+    dsn="localhost:8564", user="sys", password="exasol",
+    encryption=True, websocket_sslopt={"cert_reqs": 0},  # self-signed in Nano
+)
+stmt = conn.execute("EXECUTE SCRIPT EXA_OPTIMIZE.ANALYZE_CONSTRAINTS('INVENTORY')")
+cols = list(stmt.columns().keys())
+rows = stmt.fetchall()
+```
 
 ---
 
