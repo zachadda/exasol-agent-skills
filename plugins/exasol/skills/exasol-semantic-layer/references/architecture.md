@@ -127,6 +127,38 @@ One virtual schema, one model. Older deployments shipped this way — each model
 
 This skill defaults to multi-domain. Set `mode=single_model` parameter to fall back when interacting with legacy fixtures.
 
+## Adjacent schemas (read but do not write)
+
+Two other studio-backend schemas live on the same cluster as the registry. They are NOT this skill's surface — the skill reads from them when needed and never writes:
+
+### `SQLCUBE_META` — app state + lineage
+
+Defined in `factory-foundation/studio/backend/fixtures/sqlcube-meta/bootstrap.sql`. Seven tables:
+
+| Table | Purpose |
+|---|---|
+| `SCHEMAS` | Lineage role mapping — which schemas are STAGE / TARGET / UTILITY, plus stage→target pairings |
+| `SCRIPTS` | Audit log of CREATE SCRIPT executions (script body, hash, who installed it) |
+| `RUNS` | Execution outcome per script run (status, duration, rows affected) |
+| `SCRIPT_INSTALLS` | Drift tracking: one row per installed fixture script + body_hash |
+| `QUERY_HISTORY` | Workbench-shell query audit (KIND column separates analytic vs utility) |
+| `QUERY_FAVORITES` | User-saved query templates |
+| `CONNECTION_PROFILES` | Saved connection credentials (encrypted with `STUDIO_SESSION_SECRET`) |
+
+Initialized by `studio/backend/services/lineage.py:ensure_meta_schema()`. Schema name hardcoded `SQLCUBE_META` (no override setting in current code).
+
+Why this matters for the semantic-layer skill:
+
+- `SCHEMAS.LINEAGE_ROLE` tells the studio backend (and any consumer skill) whether a physical schema is staged data, production target data, or utility. The skill SHOULD prefer TARGET-role schemas as cube sources when one source schema has both STAGE and TARGET variants.
+- `SCRIPTS` + `RUNS` show whether the optimize UDFs (in `EXA_OPTIMIZE`) have been installed and successfully invoked.
+- `CONNECTION_PROFILES` is not relevant to the cube — but a sister skill (like `exasol-nano-local`) may write to it.
+
+### `EXA_OPTIMIZE` — UDFs only
+
+Houses the optimize Lua/SQL UDFs (`ANALYZE_CONSTRAINTS`, `DRY_RUN_PLAN`, `BUILD_UNKNOWN_MEMBER_INSERT`, `INFER_JOIN_PATHS`, etc.). Installed by `studio/backend/services/scripts_library.py` from `studio/backend/fixtures/optimization-scripts/`. Zero tables; pure function home.
+
+`EXA_OPTIMIZE_LOG` exists on the live container as an empty schema. **Not part of any current design** — earlier drafts of this skill invented persistence tables there; that's been removed.
+
 ## Why this shape
 
 **Q: Why metadata in tables, not config files?**

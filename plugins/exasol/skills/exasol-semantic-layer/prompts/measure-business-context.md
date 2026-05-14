@@ -85,17 +85,22 @@ Additional:
 
 5. **Business priority sanity.** Skill caps `high` priority at 3 per call — LLMs over-mark importance. After receiving response, take top 3 `high` by order of appearance, demote remainder to `medium`.
 
-## Storage
+## Output handling
 
-Approved measures go into `SQLCUBE_REGISTRY.MEASURES` (one row per measure, keyed by `(MODEL_ID, VIRTUAL_COL)`). The LLM's `business_priority` field is not part of the registry schema — it's stored in a side log for downstream consumers:
+Approved measures go into `SQLCUBE_REGISTRY.MEASURES` (one row per measure,
+keyed by `(MODEL_ID, VIRTUAL_COL)`). The LLM's `business_priority` field is
+not part of the registry schema — there's no Exasol-side persistence for it
+in v0.1.
 
-```sql
--- Side table for priority hints, consumed by dashboard panel-planning
-INSERT INTO EXA_OPTIMIZE_LOG.MEASURE_PRIORITY (MODEL_ID, VIRTUAL_COL, BUSINESS_PRIORITY)
-VALUES (?, ?, ?);
-```
+The skill returns priority alongside the measure JSON to the caller. The
+orchestrator (e.g., `/oneshot-tour`) may pass priorities forward to
+`exasol-dashboard` panel-planning via in-process state, but the value is
+not stored back to the database.
 
-Downstream `exasol-dashboard` reads this when picking which measures to feature in KPI tiles.
+If a future iteration adds cross-session persistence for measure metadata
+beyond what the registry already captures (`AGG_TYPE`, `FORMAT_MASK`, etc.),
+the appropriate home is a new column on `SQLCUBE_REGISTRY.MEASURES` or a new
+table in `SQLCUBE_META`, not a separately-managed log schema.
 
 ## Cost
 

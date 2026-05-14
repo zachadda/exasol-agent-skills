@@ -47,19 +47,16 @@ Output JSON:
 2. `reasoning` < 10 chars → demote confidence to `low`.
 3. If `confidence: low` AND domain is anything but `unknown` → keep but tag for plan-presentation review.
 
-## Storage
+## Output handling
 
-Single row in `EXA_OPTIMIZE_LOG.DOMAIN_HINTS` (yes, optimize's log table — semantic-layer reads from it):
+The classification is returned inline as JSON to the skill — no Exasol-side
+persistence in v0.1. The skill holds it in memory and passes the
+`<DOMAIN_HINT>` and `<SUB_DOMAIN>` strings into the subsequent
+`cube-enrichment.md` prompt template.
 
-```sql
-INSERT INTO EXA_OPTIMIZE_LOG.DOMAIN_HINTS
-  (SOURCE_SCHEMA, DOMAIN, SUB_DOMAIN, CONFIDENCE, REASONING, DETECTED_AT)
-VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
-```
-
-Cube creation reads the most recent row for the schema and injects into the larger `cube-enrichment.md` prompt.
-
-If the row exists from a previous run, skip this prompt — domain detection is stable. Only re-run when user passes `force_redetect=true` or when the schema's table list has changed substantially.
+Re-running the skill re-detects. If the user wants stable domain assignment
+across runs, supply `domain_hint` parameter explicitly and skip this prompt
+entirely.
 
 ## Cost
 

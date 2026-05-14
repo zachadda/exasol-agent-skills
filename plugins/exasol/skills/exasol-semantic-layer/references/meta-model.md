@@ -283,7 +283,7 @@ Critical:
 
 - `DIM_ALIAS` must match a DIMENSIONS row's `DIM_TABLE_ALIAS` for any column you want to expose from that join. Aliases are globally per-model: a dim joined twice (role-playing dates) gets two JOINS rows with distinct aliases (`dim2` for order date, `dim3` for ship date).
 - `DIM_KEY` is the PK column on the dim; `FACT_FK` is the FK column on the fact.
-- `JOIN_TYPE`: `LEFT` (default, keeps unmatched fact rows), `INNER` (drops them), or `RIGHT` / `FULL` (rare). The adapter emits the exact JOIN_TYPE.
+- `JOIN_TYPE`: `LEFT` keeps unmatched fact rows; `INNER` drops them. The DDL column default is `'LEFT'`, but the studio backend's deploy-time `_resolve_join_type()` (in `services/deployer.py`) overrides per-row: **INNER when the FK column is declared NOT NULL on the fact, LEFT when nullable**. The reasoning: a NOT NULL FK can never produce unmatched rows, so INNER is semantically equivalent and lets the optimizer pick hash-join shapes more aggressively. To force a specific type regardless of nullability, pass it explicitly via JOIN_PATHS.JOIN_TYPE or overwrite the resolved JOINS row.
 - `JOIN_ORDER`: lower numbers first. Order matters when joins depend on intermediate dims (snowflakes). For flat star schemas, order is cosmetic.
 
 #### ATTRIBUTES — domain-level display labels

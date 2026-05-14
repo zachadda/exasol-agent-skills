@@ -155,9 +155,11 @@ A fact with two FKs to the same dim (e.g., `ORDERDATEKEY` and `SHIPDATEKEY` both
 
 ```
 JOINS:
-  (1, factinternetsales, ADVENTUREWORKS.DIMDATE, dim2, DATEKEY, ORDERDATEKEY, LEFT, 30)
-  (2, factinternetsales, ADVENTUREWORKS.DIMDATE, dim3, DATEKEY, SHIPDATEKEY,  LEFT, 31)
+  (1, factinternetsales, ADVENTUREWORKS.DIMDATE, dim2, DATEKEY, ORDERDATEKEY, INNER, 30)
+  (2, factinternetsales, ADVENTUREWORKS.DIMDATE, dim3, DATEKEY, SHIPDATEKEY,  INNER, 31)
 ```
+
+`JOIN_TYPE='INNER'` here because both date FKs are typically declared NOT NULL on the fact. See "Join type auto-resolution" below.
 
 Then DIMENSIONS rows duplicate per role with role-prefixed `VIRTUAL_COL`:
 
@@ -170,6 +172,26 @@ DIMENSIONS:
 The `OrderDate ` prefix is convention; the actual prefix comes from the LLM-derived or override-supplied role label.
 
 Without role labels, the structural pass produces just one dim row for the first role found and skips the other — silently wrong. The skill SHOULD detect role-playing dims and require either LLM enrichment OR a `dimensions_overrides` YAML before proceeding.
+
+## Join type auto-resolution
+
+The DDL column default for `SQLCUBE_REGISTRY.JOINS.JOIN_TYPE` is `'LEFT'`, but the studio backend's `_resolve_join_type()` (in `studio/backend/services/deployer.py`) overrides per-row at deploy time. Logic:
+
+```
+if user supplied JOIN_TYPE explicitly (INNER or LEFT) → keep as-is
+else if fact's FK column is declared NOT NULL → use INNER
+else → use LEFT
+```
+
+Why: a NOT NULL FK guarantees every fact row matches a dim row, so INNER and LEFT return identical row counts — but INNER lets Exasol's optimizer pick hash-join shapes more aggressively than it would for a safety-margin LEFT.
+
+Practical implication for the skill:
+
+- The skill should NOT manually pick LEFT for every JOIN row. Let the resolver handle it.
+- After `exasol-optimize` runs and ALTERs FKs to NOT NULL (when data permits), re-deploying the cube will flip LEFT → INNER automatically on those joins. This is desirable.
+- If a JOINS row needs a specific type regardless of nullability (e.g., a deliberate outer join for orphan-row analysis), set `JOIN_PATHS.JOIN_TYPE = 'LEFT'` explicitly; the resolver respects explicit values and skips the auto-detect.
+
+`_is_fk_not_null()` queries `SYS.EXA_ALL_COLUMNS.COLUMN_IS_NULLABLE` at deploy time. The check happens once per JOIN_PATH per deploy; not a hot path.
 
 ## Refresh vs recreate
 
