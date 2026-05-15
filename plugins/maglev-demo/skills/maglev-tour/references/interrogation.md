@@ -124,4 +124,4 @@ If user wants a custom source / cube name / persona set, branch to the optional 
 
 - Don't ask for the Snowflake password — backend reads it from the pre-existing `SNOWFLAKE_CONNECTION` Exasol object.
 - Don't ask for RCLS persona passwords — backend resolves from `DEMO_RCLS_SCENARIOS`.
-- Don't ask about Java JDBC version / Arrow wrapper — operator-managed at container provision time per exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md §Setup.
+- Don't ask about Java JDBC version / Arrow wrapper — operator-managed at container provision time per exasol-maglev/FACTORY_TOUR_DEMO_PATH.md §Setup.

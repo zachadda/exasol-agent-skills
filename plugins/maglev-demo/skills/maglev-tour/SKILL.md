@@ -1,10 +1,10 @@
 ---
 name: maglev-tour
-description: Agent parody of the Maglev Tour GUI demo. Walks a stakeholder through the 8-step end-to-end pipeline — Target → Source → Schema → Migrate → Optimize → Cube → Security → Query — via the same Maglev Studio HTTP backend the GUI uses, narrating progress via TaskCreate/TaskUpdate instead of ActionLog widgets. Demo-only; not in the public exasol-skills marketplace. Source contract is documented in exasol-zemantic-layer/exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md.
+description: Agent parody of the Maglev Tour GUI demo. Walks a stakeholder through the 8-step end-to-end pipeline — Target → Source → Schema → Migrate → Optimize → Cube → Security → Query — via the same Maglev Studio HTTP backend the GUI uses, narrating progress via TaskCreate/TaskUpdate instead of ActionLog widgets. Demo-only; not in the public exasol-skills marketplace. Source contract is documented in exasol-maglev/exasol-maglev/FACTORY_TOUR_DEMO_PATH.md.
 
 preconditions:
   - studio_backend_reachable:
-      doc: "Studio FastAPI backend reachable. Default port for the Maglev Tour demo is 8002 (per exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md). Auth via cookie obtained from POST /api/auth/login {password, persona='admin'}. STUDIO_AUTH_BYPASS=true accepts any password on dev machines."
+      doc: "Studio FastAPI backend reachable. Default port for the Maglev Tour demo is 8002 (per exasol-maglev/FACTORY_TOUR_DEMO_PATH.md). Auth via cookie obtained from POST /api/auth/login {password, persona='admin'}. STUDIO_AUTH_BYPASS=true accepts any password on dev machines."
       check: |
         # Bash:
         # curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8002/api/auth/me
@@ -17,7 +17,7 @@ preconditions:
         # exapump sql --profile demo-tour "SELECT 1"
       satisfied_by: exasol-nano-local
   - source_connection_seeded:
-      doc: "Exasol-side CONNECTION object pointing at the demo source. Default for Maglev Tour: SNOWFLAKE_CONNECTION → qaasyds-bq49773.snowflakecomputing.com / ACME_DEMO / ADVENTUREWORKS. Operator-seeded one-time per exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md §Setup step 3."
+      doc: "Exasol-side CONNECTION object pointing at the demo source. Default for Maglev Tour: SNOWFLAKE_CONNECTION → qaasyds-bq49773.snowflakecomputing.com / ACME_DEMO / ADVENTUREWORKS. Operator-seeded one-time per exasol-maglev/FACTORY_TOUR_DEMO_PATH.md §Setup step 3."
       check: |
         # SQL:
         # SELECT 1 FROM SYS.EXA_ALL_CONNECTIONS WHERE CONNECTION_NAME='SNOWFLAKE_CONNECTION';
@@ -82,7 +82,7 @@ not_in_marketplace: true
 
 # /maglev-tour — agent parody of the GUI Maglev Tour
 
-End-to-end demo orchestrator. Same backend endpoints the GUI hits (`studio/frontend/src/pages/FactoryTour.jsx`); the agent replaces ActionLog widgets with `TaskCreate` / `TaskUpdate` progress. Source of truth: `exasol-zemantic-layer/exasol-zemantic-layer/FACTORY_TOUR_DEMO_PATH.md`.
+End-to-end demo orchestrator. Same backend endpoints the GUI hits (`studio/frontend/src/pages/FactoryTour.jsx`); the agent replaces ActionLog widgets with `TaskCreate` / `TaskUpdate` progress. Source of truth: `exasol-maglev/exasol-maglev/FACTORY_TOUR_DEMO_PATH.md`.
 
 ## When to trigger
 

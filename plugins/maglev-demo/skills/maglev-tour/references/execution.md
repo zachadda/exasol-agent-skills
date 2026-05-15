@@ -104,7 +104,7 @@ POST /api/optimize/analyze categories=["date_dim"]
 → may run ANALYZE_DIM_DATE for calendar enrichment
 ```
 
-**Two-pass is required** — the UDF's value-match only confirms FKs against dims that already have PKs. First pass adds PKs + ~3 high-confidence FKs (PRODUCT, PROMOTION, SALESTERRITORY in ADW) + unknown-member INSERTs. Second pass surfaces the remaining ~5 FKs (CUSTOMERKEY, ORDERDATEKEY, DUEDATEKEY, SHIPDATEKEY, CURRENCYKEY) once dim PKs exist for value-matching. Without the second pass: DIMSALESTERRITORY can stay un-joined → Sales Territory Country attr won't be in the cube → Step 7 RCLS predicate references a name the adapter can't translate → Step 8 fails with `object "Sales Territory Country" not found`. Documented in `exasol-zemantic-layer/MAGLEV_RCLS_DEEP_DIVE.md` root-cause #1.
+**Two-pass is required** — the UDF's value-match only confirms FKs against dims that already have PKs. First pass adds PKs + ~3 high-confidence FKs (PRODUCT, PROMOTION, SALESTERRITORY in ADW) + unknown-member INSERTs. Second pass surfaces the remaining ~5 FKs (CUSTOMERKEY, ORDERDATEKEY, DUEDATEKEY, SHIPDATEKEY, CURRENCYKEY) once dim PKs exist for value-matching. Without the second pass: DIMSALESTERRITORY can stay un-joined → Sales Territory Country attr won't be in the cube → Step 7 RCLS predicate references a name the adapter can't translate → Step 8 fails with `object "Sales Territory Country" not found`. Documented in `exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md` root-cause #1.
 
 **Idempotent ADD CONSTRAINT** — re-runs hit "constraint name already used" errors. Catch the error, `DROP CONSTRAINT <name>` by parsing the name from the error message, retry ADD. The GUI's OptimizeStepContainer does this; CLI/agent path must match.
 
@@ -189,7 +189,7 @@ Body: { "domain_id": "internet_sales" }
 → ALTER VIRTUAL SCHEMA REFRESH (adapter cache invalidate)
 ```
 
-Three-patch RCLS history (`exasol-zemantic-layer/MAGLEV_RCLS_DEEP_DIVE.md`):
+Three-patch RCLS history (`exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md`):
 - **Patch A** (Step 5 above) — two-pass ANALYZE_CONSTRAINTS so DIMSALESTERRITORY lands in the cube
 - **Patch B** (this step) — registry-table grants per demo user (was the silent-failure bug)
 - **Patch C** (this step) — `ALTER VIRTUAL SCHEMA <name> REFRESH` after INSERTs so adapter drops cached `adapterNotes`

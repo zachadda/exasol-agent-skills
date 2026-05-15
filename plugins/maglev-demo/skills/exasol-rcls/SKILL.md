@@ -136,7 +136,7 @@ Then hand off to `exasol-query-personas` for the actual persona-switch demonstra
 
 The Lua adapter at `sqlcube/adapter/metadata_registry.lua` reads `RCLS_ROW_POLICIES` once per query (cached in `adapterNotes`), filters by `CURRENT_USER`, OR-joins the matching ALLOW predicates, rewrites business names to physical columns via `rewrite_semantic_predicate`, and AND-joins the result into the pushdown SQL's WHERE clause.
 
-## The three-layer bug (post-mortem — `exasol-zemantic-layer/MAGLEV_RCLS_DEEP_DIVE.md`)
+## The three-layer bug (post-mortem — `exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md`)
 
 These three issues stacked on each other in the GUI demo. All three patches must hold for RCLS to actually enforce. The current `seed-demo` endpoint embeds patches B + C; patch A lives in the upstream Tour Optimize step.
 
