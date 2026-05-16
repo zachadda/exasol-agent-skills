@@ -29,7 +29,7 @@ preconditions:
         # SELECT 1 FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA='EXA_DB_MIGRATION' AND SCRIPT_NAME='SNOWFLAKE_TO_EXASOL';
       satisfied_by: exasol-migrate
   - optimize_udfs_installed:
-      doc: "EXA_OPTIMIZE.* UDFs installed (ANALYZE_CONSTRAINTS, ANALYZE_DIM_DATE, BUILD_UNKNOWN_MEMBER_INSERT, DRY_RUN_PLAN, etc.)"
+      doc: "EXA_OPTIMIZE.* UDFs installed. Tier 2 path requires the 8 PROPOSE/APPLY pairs: PROPOSE_FK + APPLY_FK_PROPOSALS, PROPOSE_DIM_DATE + APPLY_DIM_DATE, PROPOSE_JOIN_PATHS + APPLY_JOIN_PATHS, PROPOSE_UNKNOWN_MEMBER + APPLY_UNKNOWN_MEMBER. Legacy ANALYZE_CONSTRAINTS / ANALYZE_DIM_DATE / BUILD_UNKNOWN_MEMBER_INSERT remain installed for back-compat but are not used by the post-Tier-2 tour."
       check: |
         # SQL:
         # SELECT COUNT(*) FROM SYS.EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA='EXA_OPTIMIZE';
@@ -38,11 +38,11 @@ preconditions:
 
 provides:
   - cube_live:
-      doc: "SQLCUBE_ACME_ADVENTUREWORKS virtual schema returns rows for the canonical demo query (sales by territory country)."
+      doc: "LATTICE_ACME_ADVENTUREWORKS virtual schema returns rows for the canonical demo query (sales by territory country)."
       verify: |
         SELECT 1 FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = :target_cube_name;
   - rcls_seeded:
-      doc: "Four demo personas (SYS / RCLS_CANADA / RCLS_EUROPE / RCLS_EXEC) exist, four ROW policies wired in SQLCUBE_REGISTRY.RCLS_ROW_POLICIES, virtual schema refreshed."
+      doc: "Four demo personas (SYS / RCLS_CANADA / RCLS_EUROPE / RCLS_EXEC) exist, four ROW policies wired in SQLCUBE_REGISTRY.RCLS_ROW_POLICIES (registry table name unchanged per Tier 2 §Non-Goals), virtual schema refreshed."
       verify: |
         SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES WHERE MODEL_ID = :model_id;
         -- Expect 4 rows.
@@ -53,8 +53,8 @@ parameters:
   required: []
   optional:
     - target_cube_name:
-        default: "SQLCUBE_ACME_ADVENTUREWORKS"
-        doc: "Virtual schema name created in Step 6."
+        default: "LATTICE_ACME_ADVENTUREWORKS"
+        doc: "Virtual schema name created in Step 6. Post-Tier-2 VS naming = `LATTICE_<source>`. Pre-Tier-2 demo runs landed at `SQLCUBE_<source>` — drop those first if migrating an existing fixture."
     - source_connection_name:
         default: "SNOWFLAKE_CONNECTION"
         doc: "Exasol CONNECTION to use as the source."
@@ -101,8 +101,8 @@ Eight phases. Each phase hits a known studio HTTP endpoint, verifies the underly
 | 2 | Source | exasol-migrate | `POST /api/import/jdbc/test-connection` |
 | 3 | Schema | exasol-migrate | `GET /api/import/jdbc/databases` + `/jdbc/schemas` |
 | 4 | Migrate | exasol-migrate | `POST /api/import/snowflake/preview-migration` → fan-out `POST /api/import/snowflake/run-sql` |
-| 5 | Optimize | exasol-optimize | `POST /api/optimize/analyze` (constraints + date_dim) → `POST /api/optimize/run-sql` per finding (two-pass) |
-| 6 | Cube | exasol-semantic-layer | `GET /api/sqlcube/introspect-sql` → run + `POST /api/sqlcube/introspect-from-rows` → `POST /api/sqlcube/generate` → `POST /api/sqlcube/apply-metric-pack` → `POST /api/deploy/execute` |
+| 5 | Optimize | exasol-optimize | `POST /api/optimize/propose-fk` + `/apply-fk` (+ `propose-dim-date`, `apply-dim-date`, `propose-unknown-member`, `apply-unknown-member`) — two-pass for FK discovery |
+| 6 | Cube | exasol-semantic-layer | `GET /api/lattice/introspect-sql` → run + `POST /api/lattice/introspect-from-rows` → `POST /api/lattice/generate` → `POST /api/lattice/apply-metric-pack` → `POST /api/deploy/execute` |
 | 7 | Security | **exasol-rcls** (this plugin) | `POST /api/browser/security/seed-demo` |
 | 8 | Query | **exasol-query-personas** (this plugin) | `POST /api/query/execute {execution_user, sql}` for each persona |
 

@@ -85,35 +85,52 @@ ORDER BY 1;
 
 First Snowflake call is always slow (~6s for OCSP cache + session warmup). Mention once, don't keep apologizing.
 
-### Step 5 — Optimize (UDFs + two-pass)
+### Step 5 — Optimize (PROPOSE/APPLY + two-pass)
+
+Tier 2 replaced the `analyze` + `run-sql` orchestration with stable-id PROPOSE/APPLY UDF pairs. PROPOSE returns proposal rows with `proposal_id`; APPLY consumes id lists and is idempotent + self-correcting (catalog disagreement triggers internal `DROP + ADD`, no client-side retry needed).
 
 ```
-POST /api/optimize/analyze
-Body: { "schema_name": "ACME_ADVENTUREWORKS", "categories": ["constraints"] }
-→ findings rows with sql_steps[].sql
+# Pass 1 — propose + apply for the 4 categories
+POST /api/optimize/propose-fk
+Body: { "schema_name": "ACME_ADVENTUREWORKS" }
+→ { "proposals": [{ proposal_id, fact_table, fact_col, ref_table, ref_col,
+                    total_score, action_kind, rationale_text, ... }, ...] }
 
-POST /api/optimize/run-sql per finding
-→ applies the ALTER TABLE (idempotent; catches "constraint already used")
+POST /api/optimize/apply-fk
+Body: { "schema_name": "ACME_ADVENTUREWORKS",
+        "proposal_ids": ["<id1>", "<id2>", ...] }
+→ { "audit": [{ proposal_id, action_name, result_flag, elapsed_ms,
+                sql_executed, error_message }, ...] }
 
-POST /api/optimize/analyze  (second pass)
-→ newly-validated FKs emerge once dim PKs exist
+POST /api/optimize/propose-dim-date  + /api/optimize/apply-dim-date
+POST /api/optimize/propose-unknown-member + /api/optimize/apply-unknown-member
 
-POST /api/optimize/run-sql per new finding
+# Pass 2 — repeat propose-fk + apply-fk
+POST /api/optimize/propose-fk
+→ second-pass proposals (FKs whose dim PK only existed after pass-1 APPLY)
+POST /api/optimize/apply-fk
+→ idempotent NOOP for already-applied; ADD for newly-justified
 
-POST /api/optimize/analyze categories=["date_dim"]
-→ may run ANALYZE_DIM_DATE for calendar enrichment
+# Optional — join-path inference once FKs land
+POST /api/optimize/propose-join-paths + /api/optimize/apply-join-paths
 ```
 
-**Two-pass is required** — the UDF's value-match only confirms FKs against dims that already have PKs. First pass adds PKs + ~3 high-confidence FKs (PRODUCT, PROMOTION, SALESTERRITORY in ADW) + unknown-member INSERTs. Second pass surfaces the remaining ~5 FKs (CUSTOMERKEY, ORDERDATEKEY, DUEDATEKEY, SHIPDATEKEY, CURRENCYKEY) once dim PKs exist for value-matching. Without the second pass: DIMSALESTERRITORY can stay un-joined → Sales Territory Country attr won't be in the cube → Step 7 RCLS predicate references a name the adapter can't translate → Step 8 fails with `object "Sales Territory Country" not found`. Documented in `exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md` root-cause #1.
+**Two-pass is still required** — PROPOSE_FK value-match only confirms FKs against dims that already have PKs. First pass adds PKs + ~3 high-confidence FKs (PRODUCT, PROMOTION, SALESTERRITORY in ADW) + unknown-member INSERTs. Second pass surfaces the remaining ~5 FKs (CUSTOMERKEY, ORDERDATEKEY, DUEDATEKEY, SHIPDATEKEY, CURRENCYKEY) once dim PKs exist for value-matching. Without the second pass: DIMSALESTERRITORY can stay un-joined → Sales Territory Country attr won't be in the cube → Step 7 RCLS predicate references a name the adapter can't translate → Step 8 fails with `object "Sales Territory Country" not found`. Documented in `exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md` root-cause #1.
 
-**Idempotent ADD CONSTRAINT** — re-runs hit "constraint name already used" errors. Catch the error, `DROP CONSTRAINT <name>` by parsing the name from the error message, retry ADD. The GUI's OptimizeStepContainer does this; CLI/agent path must match.
+**Idempotency is server-side now** — `APPLY_FK_PROPOSALS` emits audit rows with `action_name = NOOP | ADD | DROP_AND_ADD` and `result_flag = OK | SKIPPED | ERROR`. Re-runs return `NOOP/SKIPPED` for already-applied proposals. The legacy client-side "catch constraint-name-collision → DROP + retry" loop is no longer needed for proposal-shape findings; the UDF handles catalog disagreement internally.
 
-**Pass-2 apply errors are noisy — classify them.** Live-verified during cold-start rehearsal 2026-05-14: pass 2 returned 32 findings, only 9 cleanly applied. The 23 errors split into two categories:
+**Apply audit rows — classify them.** Each audit row carries the per-proposal outcome:
 
-- **"constraint name already used"** — idempotent collision. Drop + retry, then count as success.
-- **"constraint violation - foreign key (FK_<NAME> on table <TABLE>)"** — data quality issue. The UDF is being optimistic; the proposed FK fails value-match because actual rows reference dim keys that don't exist (or value-match thresholds were marginal on pass 1 and crossed on pass 2). **Skip these silently** — the FK that would have landed wasn't justified by the data. The cube introspection will still see the FKs that DID land.
+- `result_flag = OK` → applied successfully (ADD or DROP_AND_ADD)
+- `result_flag = NOOP/SKIPPED` → already converged or proposal not applicable
+- `result_flag = ERROR` + `error_message` contains `constraint violation - foreign key` → data quality issue. UDF was optimistic; proposed FK fails value-match because actual rows reference dim keys that don't exist. **Skip silently** — the FK that would have landed wasn't justified by the data.
+- `result_flag = ERROR` otherwise → surface to user; halt or downgrade per discretion
 
-Heuristic: catch errors whose message contains `constraint violation - foreign key`, log at INFO not ERROR, continue. Don't surface to the user as "Optimize failed" — Optimize succeeded for every finding the data actually supports. Demo punchline still lands because DIMSALESTERRITORY's FK is high-confidence and consistently passes value-match.
+Heuristic: count OK + NOOP + SKIPPED as success. Filter ERROR rows by `error_message` substring; demote `constraint violation - foreign key` to INFO. Don't surface as "Optimize failed" — Optimize succeeded for every proposal the data actually supports. Demo punchline still lands because DIMSALESTERRITORY's FK is high-confidence.
+
+**Batching helper** — the frontend exposes `applyFindings(schemaName, findings)` in `studio/frontend/src/api/lattice.js` that groups findings by `proposal_kind` and fires the matching APPLY in one call per kind. The agent path can either call the per-kind endpoints directly or reuse the helper's grouping logic. Findings without `proposal_id` / `proposal_kind` (legacy shape) still need the old per-SQL apply via `runOptimizeSql` — but the post-Tier-2 backend doesn't emit those for the categories above.
+
+**Legacy `/api/optimize/analyze` + `/api/optimize/run-sql`** — still mounted for back-compat, but the post-Tier-2 tour does NOT use them. They will be removed once every consumer flips. `/api/lattice/optimize/*` (pre-rename intermediate prefix) returns 410 Gone with redirect to `/api/optimize/*`.
 
 AI "thinking" stream (8s) renders fake recommendations from `factoryDemoLLM.js` in the GUI. **The agent SHOULD run a real LLM enrichment narration here** — not pre-baked text — since the agent IS the LLM. The UDF findings are real; the narration just summarizes them.
 
@@ -121,17 +138,19 @@ AI "thinking" stream (8s) renders fake recommendations from `factoryDemoLLM.js` 
 
 Six sub-calls in order. Each is owned by `exasol-semantic-layer` — see its `references/deploy-flow.md` for the full HTTP contract:
 
+Tier 2 Phase B.2 renamed the customer-facing surface from `/api/sqlcube/*` to `/api/lattice/*`, and the deployed artifacts from `SQLCUBE.ADAPTER` / `SQLCUBE_<TARGET>` to `LATTICE.ADAPTER` / `LATTICE_<TARGET>`. `SQLCUBE_REGISTRY` substrate tables keep their original names per plan §Non-Goals.
+
 ```
-1. GET  /api/sqlcube/introspect-sql?schema_name=ACME_ADVENTUREWORKS
+1. GET  /api/lattice/introspect-sql?schema_name=ACME_ADVENTUREWORKS
    → { sql: "<UNION-ALL SELECT>" }
 
 2. POST /api/query/execute   (run the introspection SQL)
    → rows
 
-3. POST /api/sqlcube/introspect-from-rows {schema_name, rows}
+3. POST /api/lattice/introspect-from-rows {schema_name, rows}
    → ParsedDDL
 
-4. POST /api/sqlcube/generate
+4. POST /api/lattice/generate
    Body: {
      parsed_ddl,
      view_strategy: "native",
@@ -144,14 +163,14 @@ Six sub-calls in order. Each is owned by `exasol-semantic-layer` — see its `re
        business_process: ""
      }
    }
-   → SqlcubeModel with 4 domains (atomic + by_month + by_product + by_month_product), ~140 attrs
+   → LatticeModel with 4 domains (atomic + by_month + by_product + by_month_product), ~140 attrs
 
 5. **Sanitize attributes** (client-side step — matches GUI `sanitizeGeneratedModelAttributes` in `studio/frontend/src/components/panels/CubeCreatorPanel.jsx:1953`).
    For each `metric_agg` attribute: if `formula` is a bare aggregate keyword (`"SUM"`, `"COUNT"`, etc.), move it into `agg_function` and null the formula. If `formula` is a simple fact-column reference (`"f.SALESAMOUNT"`), move it into `physical_col`.
    For each `metric_calc` attribute with a bare-aggregate `formula`: convert to `metric_agg` if there's a `physical_col`, else **drop the attribute** with a `dropped_bare_metric_calc` warning.
    Returns `{attributes, warnings, infos}`. The agent must apply this BEFORE metric-pack — otherwise validator at deploy-time will reject bare-aggregate formulas.
 
-6. POST /api/sqlcube/apply-metric-pack    (** Maglev Tour-specific **)
+6. POST /api/lattice/apply-metric-pack    (** Maglev Tour-specific **)
    Body: { source_schema, domains, attributes, pack_name: null }
    → auto-detects 'adventureworks' pack when any `domain_id` contains `internet_sales`, adds 4 attrs per domain (`gross_profit`, `gross_margin_pct`, `distinct_customer_count`, `distinct_product_count`) + replaces UNIT_PRICE-family metric_agg with weighted metric_calc. All injected attrs land with `is_visible=true` (overrides validator ranking). For 4 domains: +16 net new attrs.
 
@@ -165,11 +184,13 @@ Six sub-calls in order. Each is owned by `exasol-semantic-layer` — see its `re
      owner_type: "STUDIO_USER",
      is_system_managed: false
    }
-   → success: true, virtual_schema_name: "SQLCUBE_ACME_ADVENTUREWORKS"
-   → backend creates SQLCUBE_REGISTRY tables if missing, INSERTs MODELS/DIMENSIONS/MEASURES/JOINS,
-     deploys adapter via CREATE OR REPLACE LUA ADAPTER SCRIPT SQLCUBE.ADAPTER, runs
-     CREATE VIRTUAL SCHEMA "SQLCUBE_<TARGET>" USING SQLCUBE.ADAPTER.
+   → success: true, virtual_schema_name: "LATTICE_ACME_ADVENTUREWORKS"
+   → backend creates SQLCUBE_REGISTRY tables if missing (registry name unchanged per Tier 2 §Non-Goals),
+     INSERTs MODELS/DIMENSIONS/MEASURES/JOINS, deploys adapter via CREATE OR REPLACE LUA ADAPTER SCRIPT
+     LATTICE.ADAPTER, runs CREATE VIRTUAL SCHEMA "LATTICE_<TARGET>" USING LATTICE.ADAPTER.
 ```
+
+**Legacy `/api/sqlcube/*` returns 410 Gone** with a detail message pointing at `/api/lattice/<rest>`. If migrating an existing demo-tour fixture, drop any pre-Tier-2 `SQLCUBE.ADAPTER` adapter script + `SQLCUBE_<source>` virtual schemas first — coexistence is not supported per the recorded Tier 2 spec.
 
 Step 5 above is **demo-specific** — `services/metric_packs.py` auto-detects `internet_sales` domain and injects the pack. For non-ADW schemas this is a no-op.
 
@@ -190,7 +211,7 @@ Body: { "domain_id": "internet_sales" }
 ```
 
 Three-patch RCLS history (`exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md`):
-- **Patch A** (Step 5 above) — two-pass ANALYZE_CONSTRAINTS so DIMSALESTERRITORY lands in the cube
+- **Patch A** (Step 5 above) — two-pass `PROPOSE_FK` + `APPLY_FK_PROPOSALS` so DIMSALESTERRITORY lands in the cube (pre-Tier-2: two-pass `ANALYZE_CONSTRAINTS`)
 - **Patch B** (this step) — registry-table grants per demo user (was the silent-failure bug)
 - **Patch C** (this step) — `ALTER VIRTUAL SCHEMA <name> REFRESH` after INSERTs so adapter drops cached `adapterNotes`
 

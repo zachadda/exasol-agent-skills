@@ -18,7 +18,7 @@ Detect via:
 -- Bare `AS cube` errors with `syntax error, unexpected CUBE_`. Quote it.
 SELECT
   (SELECT COUNT(*) FROM SYS.EXA_SCHEMAS WHERE SCHEMA_NAME = 'ACME_ADVENTUREWORKS')                AS "migrated",
-  (SELECT COUNT(*) FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'SQLCUBE_ACME_ADVENTUREWORKS') AS "cube",
+  (SELECT COUNT(*) FROM SYS.EXA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'LATTICE_ACME_ADVENTUREWORKS') AS "cube",
   (SELECT COUNT(*) FROM SQLCUBE_REGISTRY.RCLS_ROW_POLICIES WHERE MODEL_ID = 'internet_sales')     AS "rcls";
 ```
 
@@ -30,7 +30,7 @@ When the probe returns warm, do **not** auto-skip phases. The user may have run 
 
 ```
 agent:
-  Warm-state detected — ACME_ADVENTUREWORKS migrated, SQLCUBE_ACME_ADVENTUREWORKS
+  Warm-state detected — ACME_ADVENTUREWORKS migrated, LATTICE_ACME_ADVENTUREWORKS
   cube live with 4 RCLS row policies seeded.
 
   Three options:
@@ -63,7 +63,7 @@ EXECUTE SCRIPT EXA_OPTIMIZE.RESET_TOUR_STATE(
 ```
 
 Returns `(STEP, TARGET_OBJ, ELAPSED_MS, RESULT_FLAG, NOTE)` per step:
-- `DROP_VIRTUAL_SCHEMA` — `SQLCUBE_<SOURCE>` cleared
+- `DROP_VIRTUAL_SCHEMA` — `LATTICE_<SOURCE>` cleared
 - `DROP_SCHEMA` — `<SOURCE>` cleared (CASCADE)
 - `DELETE_REGISTRY` × N — one row per (table, model_id) pair: RCLS_ATTRIBUTE_POLICIES, RCLS_ROW_POLICIES, DERIVED_MEASURES, JOINS, MEASURES, DIMENSIONS, MODELS (model-id-keyed); JOIN_PATHS, ATTRIBUTES, DOMAINS (domain-id-keyed)
 - `SUMMARY` — total models cleared
@@ -75,7 +75,7 @@ What survives (intentional):
 - `SNOWFLAKE_CONNECTION` and other Exasol CONNECTION objects
 - `EXA_OPTIMIZE.*` UDFs (including this one)
 - `EXA_DB_MIGRATION.*` migration scripts
-- `SQLCUBE.ADAPTER` Lua script + `SQLCUBE_REGISTRY` table DDL
+- `LATTICE.ADAPTER` Lua script + `SQLCUBE_REGISTRY` table DDL
 
 ### Fallback if UDF not installed
 
@@ -85,7 +85,7 @@ If `EXECUTE SCRIPT EXA_OPTIMIZE.RESET_TOUR_STATE` returns "script not found", th
 2. Direct SQL (verbose; lose the audit-row narration):
 
    ```sql
-   DROP VIRTUAL SCHEMA IF EXISTS "SQLCUBE_ACME_ADVENTUREWORKS" CASCADE;
+   DROP VIRTUAL SCHEMA IF EXISTS "LATTICE_ACME_ADVENTUREWORKS" CASCADE;
    DROP SCHEMA IF EXISTS "ACME_ADVENTUREWORKS" CASCADE;
    -- Repeat per domain:
    -- internet_sales, internet_sales_by_month,
