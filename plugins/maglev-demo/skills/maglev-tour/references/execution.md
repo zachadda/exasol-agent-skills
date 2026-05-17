@@ -99,7 +99,20 @@ ORDER BY 1;
 Tier 2 replaced the `analyze` + `run-sql` orchestration with stable-id PROPOSE/APPLY UDF pairs. PROPOSE returns proposal rows with `proposal_id`; APPLY consumes id lists and is idempotent + self-correcting (catalog disagreement triggers internal `DROP + ADD`, no client-side retry needed).
 
 ```
-# Pass 1 — propose + apply for the 4 categories
+# PK first — dims need a PRIMARY KEY before FK ADD can succeed on the fact side
+POST /api/optimize/propose-pk
+Body: { "schema_name": "ACME_ADVENTUREWORKS" }
+→ { "proposals": [{ proposal_id, target_table, column_names, score,
+                    null_count, distinct_count, row_count,
+                    score_components, proposal_type }, ...] }
+
+POST /api/optimize/apply-pk
+Body: { "schema_name": "ACME_ADVENTUREWORKS",
+        "proposal_ids": ["<id1>", "<id2>", ...] }
+→ { "audit": [{ proposal_id, action_name, result_flag, elapsed_ms,
+                sql_executed, error_message }, ...] }
+
+# Then the four PROPOSE/APPLY categories
 POST /api/optimize/propose-fk
 Body: { "schema_name": "ACME_ADVENTUREWORKS" }
 → { "proposals": [{ proposal_id, fact_table, fact_col, ref_table, ref_col,
@@ -114,7 +127,7 @@ Body: { "schema_name": "ACME_ADVENTUREWORKS",
 POST /api/optimize/propose-dim-date  + /api/optimize/apply-dim-date
 POST /api/optimize/propose-unknown-member + /api/optimize/apply-unknown-member
 
-# Pass 2 — repeat propose-fk + apply-fk
+# Pass 2 — repeat propose-fk + apply-fk (optional after PK pass)
 POST /api/optimize/propose-fk
 → second-pass proposals (FKs whose dim PK only existed after pass-1 APPLY)
 POST /api/optimize/apply-fk
@@ -124,18 +137,25 @@ POST /api/optimize/apply-fk
 POST /api/optimize/propose-join-paths + /api/optimize/apply-join-paths
 ```
 
-**Two-pass is still required** — PROPOSE_FK value-match only confirms FKs against dims that already have PKs. First pass adds PKs + ~3 high-confidence FKs (PRODUCT, PROMOTION, SALESTERRITORY in ADW) + unknown-member INSERTs. Second pass surfaces the remaining ~5 FKs (CUSTOMERKEY, ORDERDATEKEY, DUEDATEKEY, SHIPDATEKEY, CURRENCYKEY) once dim PKs exist for value-matching. Without the second pass: DIMSALESTERRITORY can stay un-joined → Sales Territory Country attr won't be in the cube → Step 7 RCLS predicate references a name the adapter can't translate → Step 8 fails with `object "Sales Territory Country" not found`. Documented in `exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md` root-cause #1.
+**PK before FK is the bedrock ordering.** Exasol rejects `ALTER TABLE … ADD CONSTRAINT FOREIGN KEY` when the referenced table has no PRIMARY KEY. `APPLY_FK_PROPOSALS` returns `action_name='PRECONDITION_MISSING'`, `result_flag='SKIPPED'` for every FK whose referenced dim lacks a PK. Run `apply-pk` first; the FK calls afterward succeed in the same Phase 5 click. The frontend `applyFindings` helper dispatches in this order explicitly: `['pk', 'fk', 'dim-date', 'join-paths', 'unknown-member']`.
+
+**PK apply outcomes:** `APPLY_PK_PROPOSALS` emits one audit row per proposal_id with `action_name ∈ {ADD, NOOP, EXISTING_PK_DIFFERS}` and `result_flag ∈ {OK, SKIPPED}`. `NOOP / OK` = catalog already matches (idempotent re-run); `EXISTING_PK_DIFFERS / SKIPPED` = catalog has a PK on different columns from the proposal (operator decides whether to drop manually; UDF refuses to auto-drop because FKs reference PKs and auto-drop would orphan them). `unknown proposal_id` returns `NOOP / SKIPPED` with the id in `error_message` — no runtime error.
+
+**Two-pass is still useful** — PROPOSE_FK value-match only confirms FKs against dims that already have PKs. First FK pass after the PK pass adds ~3 high-confidence FKs (PRODUCT, PROMOTION, SALESTERRITORY in ADW) + unknown-member INSERTs. Second FK pass surfaces the remaining ~5 FKs (CUSTOMERKEY, ORDERDATEKEY, DUEDATEKEY, SHIPDATEKEY, CURRENCYKEY) once dim PKs exist for value-matching. Without the second pass: DIMSALESTERRITORY can stay un-joined → Sales Territory Country attr won't be in the cube → Step 7 RCLS predicate references a name the adapter can't translate → Step 8 fails with `object "Sales Territory Country" not found`. Documented in `exasol-maglev/MAGLEV_RCLS_DEEP_DIVE.md` root-cause #1.
 
 **Idempotency is server-side now** — `APPLY_FK_PROPOSALS` emits audit rows with `action_name = NOOP | ADD | DROP_AND_ADD` and `result_flag = OK | SKIPPED | ERROR`. Re-runs return `NOOP/SKIPPED` for already-applied proposals. The legacy client-side "catch constraint-name-collision → DROP + retry" loop is no longer needed for proposal-shape findings; the UDF handles catalog disagreement internally.
 
-**Apply audit rows — classify them.** Each audit row carries the per-proposal outcome:
+**Apply audit rows — classify them honestly.** Each audit row carries the per-proposal outcome:
 
-- `result_flag = OK` → applied successfully (ADD or DROP_AND_ADD)
-- `result_flag = NOOP/SKIPPED` → already converged or proposal not applicable
+- `result_flag = OK` → applied successfully (`action_name = ADD`, `NOOP`, or `DROP_AND_ADD`)
+- `result_flag = SKIPPED` → distinct category from OK. Sub-shapes:
+  - `action_name = PRECONDITION_MISSING` (FK pair) → referenced dim has no PK; will resolve on the next APPLY after the PK pair runs
+  - `action_name = EXISTING_PK_DIFFERS` (PK pair) → catalog has a different PK; operator decides whether to drop manually
+  - `action_name = NOOP` + `error_message` contains `unknown proposal_id` → stale id, harmless
 - `result_flag = ERROR` + `error_message` contains `constraint violation - foreign key` → data quality issue. UDF was optimistic; proposed FK fails value-match because actual rows reference dim keys that don't exist. **Skip silently** — the FK that would have landed wasn't justified by the data.
 - `result_flag = ERROR` otherwise → surface to user; halt or downgrade per discretion
 
-Heuristic: count OK + NOOP + SKIPPED as success. Filter ERROR rows by `error_message` substring; demote `constraint violation - foreign key` to INFO. Don't surface as "Optimize failed" — Optimize succeeded for every proposal the data actually supports. Demo punchline still lands because DIMSALESTERRITORY's FK is high-confidence.
+Heuristic: count OK + NOOP as `applied`, SKIPPED separately, ERROR separately. The Phase 5 frontend counter shows `Applied N · K skipped · E errored` — don't conflate. Filter ERROR rows by `error_message` substring; demote `constraint violation - foreign key` to INFO. Don't surface as "Optimize failed" — Optimize succeeded for every proposal the data actually supports. Demo punchline still lands because DIMSALESTERRITORY's FK is high-confidence after the PK pass.
 
 **Batching helper** — the frontend exposes `applyFindings(schemaName, findings)` in `studio/frontend/src/api/lattice.js` that groups findings by `proposal_kind` and fires the matching APPLY in one call per kind. The agent path can either call the per-kind endpoints directly or reuse the helper's grouping logic. Findings without `proposal_id` / `proposal_kind` (legacy shape) still need the old per-SQL apply via `runOptimizeSql` — but the post-Tier-2 backend doesn't emit those for the categories above.
 
