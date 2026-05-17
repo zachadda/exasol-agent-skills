@@ -7,7 +7,7 @@ Before rendering the persona showcase: prove all three provides hold.
 ```sql
 -- 1. cube_live
 SELECT 1 FROM SYS.EXA_VIRTUAL_SCHEMAS
-WHERE SCHEMA_NAME = 'SQLCUBE_ACME_ADVENTUREWORKS'
+WHERE SCHEMA_NAME = 'LATTICE_ACME_ADVENTUREWORKS'
   AND ADAPTER_SCRIPT_SCHEMA = 'SQLCUBE'
   AND ADAPTER_SCRIPT_NAME = 'ADAPTER';
 
@@ -23,7 +23,7 @@ WHERE MODEL_ID = 'internet_sales';
 
 -- 3. data round-trip
 SELECT COUNT(*)
-FROM "SQLCUBE_ACME_ADVENTUREWORKS"."internet_sales";
+FROM "LATTICE_ACME_ADVENTUREWORKS"."internet_sales";
 -- Expect > 0 (live-verified: ~84k rows post-Step-4).
 ```
 

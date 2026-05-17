@@ -15,7 +15,7 @@ agent:
   | 3 | Schema           | exasol-migrate         | Source = ACME_DEMO.ADVENTUREWORKS (9 tables) |
   | 4 | Migrate          | exasol-migrate         | ACME_ADVENTUREWORKS schema on Exasol, ~84k rows, ~15s |
   | 5 | Optimize         | exasol-optimize        | 2-pass: PKs + FKs declared, DIM_DATE upgraded |
-  | 6 | Cube             | exasol-semantic-layer  | SQLCUBE_ACME_ADVENTUREWORKS virtual schema with 4 domains + ADW metric pack |
+  | 6 | Cube             | exasol-semantic-layer  | LATTICE_ACME_ADVENTUREWORKS virtual schema with 4 domains + ADW metric pack |
   | 7 | Security         | exasol-rcls            | RCLS_CANADA / RCLS_EUROPE / RCLS_EXEC users + 4 row policies |
   | 8 | Query (showcase) | exasol-query-personas  | Side-by-side persona query: same SQL, four row scopes |
 

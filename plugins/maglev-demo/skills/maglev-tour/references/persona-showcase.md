@@ -9,7 +9,7 @@ Use the `exasol-query-personas` skill — this file just documents the narration
 ```sql
 SELECT "Sales Territory Country",
        SUM("Sales Amount") AS "Total Sales"
-FROM "SQLCUBE_ACME_ADVENTUREWORKS"."internet_sales"
+FROM "LATTICE_ACME_ADVENTUREWORKS"."internet_sales"
 GROUP BY 1
 ORDER BY 2 DESC
 ```
