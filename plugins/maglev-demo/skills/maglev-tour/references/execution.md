@@ -41,39 +41,48 @@ Server-side IMPORT FROM JDBC against Snowflake INFORMATION_SCHEMA. Used to popul
 
 ### Step 4 — Migrate (Snowflake → Exasol)
 
-Four-phase per GUI (do not run the script's EXECUTE mode — it serializes tables and blows past the 15s target):
+Single-call driver-axis orchestration. Backend handles serial CREATE + parallel IMPORT fan-out server-side.
 
 ```
-1. POST /api/import/snowflake/preview-migration
-   Body: {
-     connection_name, db_filter, schema_filter, target_schema,
-     execution_mode: "EXECUTE",           // emits plan_sql in DEBUG form regardless
-     identifier_case_insensitive: true,
-     parallel_connections: "1",           // string, but Lua needs numeric → backend special-cases "1" / "AUTO"
-     db2schema: false
-   }
-   → returns {bootstrap_sql, connection_test_sql, migration_sql, plan_sql}
-
-2. POST /api/import/snowflake/run-sql {sql: bootstrap_sql}
-   → creates EXA_DB_MIGRATION schema
-
-3. POST /api/query/execute {sql: plan_sql}
-   → DEBUG-mode EXECUTE SCRIPT returns rows: (SQL_TEXT, SUCCESS, ERROR_MESSAGE) per CREATE/IMPORT
-   → NOTE: `/api/query/execute` is required here, not `/run-sql` — run-sql doesn't return rows
-     from EXECUTE SCRIPT, only success/failure (per MAGLEV_CLI_HANDOFF.md gotcha)
-
-4. Split rows into CREATE statements (CREATE SCHEMA / CREATE TABLE / ALTER / COMMENT) and
-   IMPORT statements (IMPORT FROM JDBC).
-
-5. Run CREATEs serially via POST /api/import/snowflake/run-sql {sql}
-   → CREATE SCHEMA + CREATE TABLE + comments
-
-6. Fan out IMPORTs in parallel via concurrent POST /api/import/snowflake/run-sql {sql}
-   → one HTTP call per table; backend opens fresh Snowflake JDBC session per call.
-   → In Python: concurrent.futures.ThreadPoolExecutor or httpx.AsyncClient.
+POST /api/import/jdbc/execute-plan
+Body: {
+  source_type: "snowflake",
+  connection_name: "SNOWFLAKE_CONNECTION",
+  source_db: "ACME_DEMO",
+  source_schema: "ADVENTUREWORKS",
+  target_schema: "ACME_ADVENTUREWORKS",
+  identifier_case_insensitive: true,
+  parallelism: 8
+}
+→ {
+  success: true,
+  audit: [
+    { step_kind: "CREATE_SCHEMA", target_obj: "ACME_ADVENTUREWORKS", result_flag: "OK", rows_affected: 0, elapsed_ms: 50, sql_text: "...", error_message: null },
+    { step_kind: "CREATE_TABLE", target_obj: "ACME_ADVENTUREWORKS.DIM_PRODUCT", result_flag: "OK", rows_affected: 0, elapsed_ms: 25, sql_text: "...", error_message: null },
+    { step_kind: "IMPORT", target_obj: "ACME_ADVENTUREWORKS.DIM_PRODUCT", result_flag: "OK", rows_affected: 500, elapsed_ms: 150, sql_text: "...", error_message: null },
+    ...
+  ],
+  summary: {
+    tables_created: 9,
+    rows_imported: 84000,
+    wall_time_ms: 18500,
+    error_count: 0
+  }
+}
 ```
 
-Perf target: ~15s for 84k rows on JDBC 3.20 + Arrow. Narration ticks per-table as rows complete. Verify post-migrate:
+Server orchestration flow (hidden from client):
+
+1. **DEBUG mode plan** — UDF emits CREATE + IMPORT statements without executing
+2. **Serial CREATEs** — run CREATE SCHEMA / CREATE TABLE / ALTER / COMMENT sequentially (metadata-only, fast)
+3. **Parallel IMPORTs** — fan out via `asyncio.gather()` with parallelism cap (default 8, config `STUDIO_MAX_IMPORT_PARALLELISM`)
+4. **Aggregated audit** — collect audit row per step, return summary with tables_created, rows_imported, wall_time_ms, error_count
+
+Narration: render audit rows progressively; count OK + SKIPPED as success. Each row carries step_kind, target_obj, rows_affected, elapsed_ms, result_flag, error_message.
+
+Perf target: ~15–18s for 84k rows on JDBC 3.20 + Arrow (serial CREATE ~200ms, parallel IMPORT ~18s). First Snowflake call always slow (~6s for OCSP cache + session warmup); mention once.
+
+Verify post-migrate:
 
 ```sql
 SELECT TABLE_NAME, TABLE_ROW_COUNT
@@ -83,7 +92,7 @@ ORDER BY 1;
 -- Expect 9 tables, ~84k total rows.
 ```
 
-First Snowflake call is always slow (~6s for OCSP cache + session warmup). Mention once, don't keep apologizing.
+**Legacy endpoints** — `/api/import/snowflake/preview-migration` + `/api/import/snowflake/run-sql` return 410 Gone with redirect to `/api/import/jdbc/execute-plan`. Update any existing agent paths to use the new endpoint.
 
 ### Step 5 — Optimize (PROPOSE/APPLY + two-pass)
 
